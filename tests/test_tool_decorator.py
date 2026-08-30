@@ -16,8 +16,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List
 
-from autourgos_agent import Agent, tool, Tool
-
+from autourgos_agent import Agent, Tool, tool
 
 # -- test doubles -------------------------------------------------------------
 
@@ -133,6 +132,25 @@ def test_tool_with_explicit_parameters_schema():
         return f"results for {query}"
 
     assert search["parameters"] is custom_schema
+
+
+def test_tool_policy_metadata_is_opt_in_and_preserved():
+    def describe(call):
+        return call
+
+    @tool(describe=describe, capability="files", risk="write")
+    def save(text: str) -> str:
+        return text
+
+    assert save["describe"] is describe
+    assert save["capability"] == "files"
+    assert save["risk"] == "write"
+
+    @tool
+    def legacy(text: str) -> str:
+        return text
+
+    assert set(legacy) == {"name", "description", "parameters", "func"}
 
 
 # -- (c) decorated function remains directly callable --------------------------

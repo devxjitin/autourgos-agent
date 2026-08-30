@@ -61,12 +61,13 @@ try:
         RunState,
         ToolCall as CoreToolCall,
         ToolResult as CoreToolResult,
+        ToolBinding,
         ToolSpec as CoreToolSpec,
     )
     _core_exports = [
         "Action", "ArtifactRef", "Budget", "Decision", "Effect", "Message",
         "ModelResponse", "Resource", "Risk", "RunState",
-        "CoreToolCall", "CoreToolResult", "CoreToolSpec",
+        "CoreToolCall", "CoreToolResult", "CoreToolSpec", "ToolBinding",
     ]
 except ImportError:
     pass
@@ -90,7 +91,7 @@ try:
     from importlib.metadata import version as _meta_version, PackageNotFoundError as _PNF
     __version__ = _meta_version("autourgos-agent")
 except Exception:
-    __version__ = "2.0.0"
+    __version__ = "2.7.0"
 
 __all__ = [
     "Agent",

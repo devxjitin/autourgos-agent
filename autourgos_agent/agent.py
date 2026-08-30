@@ -26,9 +26,9 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional
 
-from .base    import AgentLoopMixin, BaseAgent, BaseLLM, CallbackHandler, MemoryProtocol
+from .base import AgentLoopMixin, BaseAgent, CallbackHandler, MemoryProtocol
 from .logging import AgentLogger
-from .prompt  import PREFIX_PROMPT, LOGIC_PROMPT, SUFFIX_PROMPT
+from .prompt import LOGIC_PROMPT, PREFIX_PROMPT, SUFFIX_PROMPT
 from .runtime import parse_json_object
 
 
@@ -132,6 +132,13 @@ class Agent(AgentLoopMixin, BaseAgent):
         relying on it for anything beyond straightforward tool-calling
         agents (no mid-run tool exposure, no llm_retries, no on_iteration/
         on_before_iteration hooks).
+    capabilities : list, optional
+        Typed Capability objects exposed to the kernel. Kernel backend only.
+    policy_executor_factory : callable, optional
+        Called once per invocation as `factory(run)` and must return a policy
+        executor. Kernel backend only.
+    max_effects : int, optional
+        Maximum policy-approved effects for one run. Kernel backend only.
     """
 
     MAX_CONSECUTIVE_PARSE_ERRORS: int = 3
@@ -164,6 +171,9 @@ class Agent(AgentLoopMixin, BaseAgent):
         max_tool_output_chars: Optional[int] = None,
         max_tool_workers: Optional[int] = None,
         backend: str = "legacy",
+        capabilities: Optional[List[Any]] = None,
+        policy_executor_factory: Optional[Callable[[Any], Any]] = None,
+        max_effects: Optional[int] = None,
     ) -> None:
         if tool_calling_mode not in ("prompt", "native"):
             raise ValueError(
@@ -171,8 +181,25 @@ class Agent(AgentLoopMixin, BaseAgent):
             )
         if backend not in ("legacy", "kernel"):
             raise ValueError(f"backend must be 'legacy' or 'kernel', got {backend!r}.")
+        if max_effects is not None and (
+            not isinstance(max_effects, int) or isinstance(max_effects, bool) or max_effects < 0
+        ):
+            raise ValueError("max_effects must be a non-negative integer or None.")
+        if policy_executor_factory is not None and not callable(policy_executor_factory):
+            raise ValueError("policy_executor_factory must be callable or None.")
+        if backend != "kernel" and (
+            capabilities is not None
+            or policy_executor_factory is not None
+            or max_effects is not None
+        ):
+            raise ValueError(
+                "capabilities, policy_executor_factory, and max_effects require backend='kernel'."
+            )
         self.tool_calling_mode = tool_calling_mode
         self.backend = backend
+        self.capabilities = list(capabilities or [])
+        self.policy_executor_factory = policy_executor_factory
+        self.max_effects = max_effects
         super().__init__(
             llm=llm,
             memory=memory,

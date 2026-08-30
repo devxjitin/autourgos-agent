@@ -132,7 +132,11 @@ async def _consume_events(agent: Any, event_log: Any, cb: CallbackManager) -> No
             tool_name = event.payload.get("tool", "")
             content = event.payload.get("content")
             if content is None:
-                content = "" if event.payload.get("ok", True) else "Tool call was denied by the approval callback."
+                content = (
+                    ""
+                    if event.payload.get("ok", True)
+                    else "Tool call was denied by the approval callback."
+                )
             cb.fire_tool_end(tool_name, content, agent=agent)
             pending_tool_events.append({
                 "tool": tool_name,
@@ -149,6 +153,8 @@ async def _consume_events(agent: Any, event_log: Any, cb: CallbackManager) -> No
 
 
 def _build_engine_and_run(agent: Any, query: str, max_iterations: int, kernel: Any) -> Any:
+    from autourgos_core import Budget
+
     memory_context = _get_memory_context(getattr(agent, "memory", None), query)
     system_prompt = getattr(agent, "system_prompt", "") or ""
     if memory_context:
@@ -169,12 +175,27 @@ def _build_engine_and_run(agent: Any, query: str, max_iterations: int, kernel: A
     engine = kernel.Engine(
         llm=agent.llm,
         tools=list(getattr(agent, "tools", [])),
+        capabilities=list(getattr(agent, "capabilities", [])),
         context_manager=context_manager,
         approval_callback=getattr(agent, "approval_callback", None),
         config=config,
     )
-    run = kernel.Run(goal=query, system_prompt=system_prompt)
-    return engine, run
+    run = kernel.Run(
+        goal=query,
+        system_prompt=system_prompt,
+        budget=Budget(
+            max_iterations=max_iterations,
+            max_execution_seconds=getattr(agent, "max_execution_time", None),
+            max_effects=getattr(agent, "max_effects", None),
+        ),
+    )
+    policy_executor = None
+    policy_factory = getattr(agent, "policy_executor_factory", None)
+    if policy_factory is not None:
+        policy_executor = policy_factory(run)
+        if policy_executor is None or not callable(getattr(policy_executor, "execute", None)):
+            raise ValueError("policy_executor_factory(run) must return a policy executor.")
+    return engine, run, policy_executor
 
 
 async def ainvoke_kernel(
@@ -184,7 +205,7 @@ async def ainvoke_kernel(
     extra_kwargs: Dict[str, Any],
 ) -> str:
     kernel = _import_kernel()
-    engine, run = _build_engine_and_run(agent, query, max_iterations, kernel)
+    engine, run, policy_executor = _build_engine_and_run(agent, query, max_iterations, kernel)
 
     agent.scratchpad = ""
     event_log = kernel.EventLog()
@@ -192,7 +213,11 @@ async def ainvoke_kernel(
 
     consumer_task = asyncio.create_task(_consume_events(agent, event_log, cb))
     try:
-        result = await engine.run(run, event_log=event_log)
+        result = await engine.run(
+            run,
+            event_log=event_log,
+            policy_executor=policy_executor,
+        )
     except Exception as exc:
         raise _translate_error(exc, kernel) from exc
     finally:

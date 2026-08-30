@@ -1,13 +1,13 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "autourgos-agent"
-version = "2.6.0"
+version = "2.7.0"
 description = "Self-contained, general-purpose LLM agent for the Autourgos framework — works with any OpenAI-compatible LLM"
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "MIT"
 requires-python = ">=3.10"
 authors = [
     { name = "Jitin Kumar Sengar", email = "devxjitin@gmail.com" },
@@ -20,7 +20,6 @@ keywords = [
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -35,15 +34,17 @@ dependencies = []
 [project.optional-dependencies]
 openaichat = ["autourgos-openaichat>=2.3.1"]
 responses  = ["autourgos-responses>=2.2.1"]
-core       = ["autourgos-core>=0.1.0"]
-kernel     = ["autourgos-kernel>=0.1.2"]
+core       = ["autourgos-core>=0.2.0"]
+kernel     = ["autourgos-kernel>=0.2.0"]
+policy     = ["autourgos-core>=0.2.0", "autourgos-kernel>=0.2.0", "autourgos-policy>=0.3.0"]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
     "autourgos-openaichat>=2.3.1",
     "autourgos-responses>=2.2.1",
-    "autourgos-core>=0.1.0",
-    "autourgos-kernel>=0.1.2",
+    "autourgos-core>=0.2.0",
+    "autourgos-kernel>=0.2.0",
+    "autourgos-policy>=0.3.0",
     "build",
     "twine",
 ]

@@ -19,6 +19,8 @@ from __future__ import annotations
 import json
 
 import pytest
+from autourgos_core import Action, Risk
+from autourgos_policy import PolicyConfig, PolicyExecutor, PolicyGate
 
 from autourgos_agent import Agent, AgentMaxIterationsError, CallbackHandler, tool
 from autourgos_agent.testing import ScriptedFakeLLM, ScriptedToolCallLLM
@@ -40,6 +42,14 @@ def test_kernel_backend_rejects_unknown_backend_value():
     llm = ScriptedFakeLLM([_final("x")])
     with pytest.raises(ValueError):
         Agent(llm=llm, backend="not-a-real-backend")
+
+
+def test_policy_options_are_kernel_only_and_effect_budget_is_validated():
+    llm = ScriptedFakeLLM([_final("x")])
+    with pytest.raises(ValueError, match="backend='kernel'"):
+        Agent(llm=llm, capabilities=[])
+    with pytest.raises(ValueError, match="max_effects"):
+        Agent(llm=llm, backend="kernel", max_effects=-1)
 
 
 def test_kernel_backend_final_answer_no_tools():
@@ -215,3 +225,106 @@ def test_kernel_backend_approval_callback_can_deny_a_tool_call():
     agent.invoke("go")
 
     assert "denied" in agent.scratchpad
+
+
+def _trusted_policy(_run):
+    return PolicyExecutor(
+        PolicyGate(PolicyConfig(profile="trusted", require_targets=False))
+    )
+
+
+def test_kernel_policy_factory_executes_described_tool_and_is_per_run():
+    calls = []
+    factory_run_ids = []
+
+    def describe(call):
+        return Action(tool=call.name, arguments=call.arguments, risk=Risk.READ)
+
+    @tool(describe=describe, capability="records", risk="read")
+    def record(value: str) -> str:
+        calls.append(value)
+        return f"recorded:{value}"
+
+    def factory(run):
+        factory_run_ids.append(run.run_id)
+        return _trusted_policy(run)
+
+    llm = ScriptedToolCallLLM([
+        ScriptedToolCallLLM.tool_call("record", {"value": "a"}, "c1"),
+        ScriptedToolCallLLM.final("one"),
+        ScriptedToolCallLLM.tool_call("record", {"value": "b"}, "c2"),
+        ScriptedToolCallLLM.final("two"),
+    ])
+    agent = Agent(
+        llm=llm,
+        backend="kernel",
+        policy_executor_factory=factory,
+    )
+    agent.add_tools(record)
+
+    assert agent.invoke("first") == "one"
+    assert agent.invoke("second") == "two"
+    assert calls == ["a", "b"]
+    assert len(set(factory_run_ids)) == 2
+
+
+def test_kernel_policy_preserves_legacy_approval_exactly_once():
+    approvals = []
+    calls = []
+
+    def describe(call):
+        return Action(tool=call.name, arguments=call.arguments, risk=Risk.READ)
+
+    @tool(describe=describe)
+    def record(value: str) -> str:
+        calls.append(value)
+        return "ok"
+
+    llm = ScriptedToolCallLLM([
+        ScriptedToolCallLLM.tool_call("record", {"value": "a"}, "c1"),
+        ScriptedToolCallLLM.final("done"),
+    ])
+    agent = Agent(
+        llm=llm,
+        backend="kernel",
+        policy_executor_factory=_trusted_policy,
+        approval_callback=lambda name, args: approvals.append((name, args)) or True,
+    )
+    agent.add_tools(record)
+
+    agent.invoke("go")
+
+    assert approvals == [("record", {"value": "a"})]
+    assert calls == ["a"]
+
+
+def test_kernel_max_effects_reaches_concurrent_policy_boundary():
+    calls = []
+
+    def describe(call):
+        return Action(tool=call.name, arguments=call.arguments, risk=Risk.READ)
+
+    @tool(describe=describe)
+    def record(value: str) -> str:
+        calls.append(value)
+        return value
+
+    llm = ScriptedToolCallLLM([
+        ScriptedToolCallLLM.calls_([
+            {"name": "record", "arguments": {"value": "a"}, "call_id": "a"},
+            {"name": "record", "arguments": {"value": "b"}, "call_id": "b"},
+        ]),
+        ScriptedToolCallLLM.final("done"),
+    ])
+    agent = Agent(
+        llm=llm,
+        backend="kernel",
+        policy_executor_factory=_trusted_policy,
+        max_effects=1,
+    )
+    agent.add_tools(record)
+
+    agent.invoke("go")
+
+    assert len(calls) == 1
+    assert "Effect budget exhausted" in agent.scratchpad

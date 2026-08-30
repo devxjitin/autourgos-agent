@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.7.0
+
+- Added kernel-only `capabilities`, `policy_executor_factory`, and
+  `max_effects` options. A fresh policy executor is created for every run.
+- Kernel tool calls can now flow through typed Action description, policy
+  decision, confirmation, sandbox execution, and effect journaling.
+- Extended `@tool` with opt-in `describe`, `capability`, and `risk` metadata;
+  tools without those arguments keep their original four-key dictionary shape.
+- Existing `approval_callback(tool_name, arguments)` semantics are preserved in
+  policy mode and are invoked exactly once for every otherwise-allowed action.
+- Updated optional dependency floors for core 0.2, kernel 0.2, and policy 0.3;
+  the default install and legacy backend still have zero required dependencies.
+
 ## 2.6.0
 
 - Added `Agent(backend="kernel")` (default remains `backend="legacy"`,

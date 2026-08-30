@@ -1,5 +1,25 @@
 # Changelog
 
+## 2.6.0
+
+- Added `Agent(backend="kernel")` (default remains `backend="legacy"`,
+  the original loop implementation, completely unaffected): an opt-in
+  bridge that delegates `invoke()`/`ainvoke()` to `autourgos-kernel`'s
+  `Engine`/`Run` instead, for `Run`-based state isolation and
+  checkpoint/resume. Requires `pip install autourgos-agent[kernel]`;
+  `autourgos-kernel` is not a required dependency. Translates the
+  kernel's exception hierarchy onto the existing `AgentError` subclasses
+  and its event stream onto the existing `CallbackHandler` hooks and
+  `agent.scratchpad`, so code written against `Agent`'s public contract
+  doesn't need to know which backend ran. Has a few documented behavioral
+  gaps vs `backend="legacy"` — see `autourgos_agent/kernel_backend.py`'s
+  module docstring (no mid-run tool exposure, no `llm_retries`, no
+  `on_iteration`/`on_before_iteration` hooks, `**kwargs` per-call LLM
+  overrides not forwarded). 10 new tests (skipped, not failed, when
+  `autourgos-kernel` isn't installed); the existing 95 tests are
+  unaffected either way — verified both with and without
+  `autourgos-core`/`autourgos-kernel` installed.
+
 ## 2.5.0
 
 - Added an optional `[core]` extra (`pip install autourgos-agent[core]`)

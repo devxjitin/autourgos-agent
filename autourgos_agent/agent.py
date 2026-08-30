@@ -120,6 +120,18 @@ class Agent(AgentLoopMixin, BaseAgent):
         Per-instance override of MAX_TOOL_OUTPUT_CHARS (class default 5,000).
     max_tool_workers : int, optional
         Per-instance override of MAX_TOOL_WORKERS (class default 8).
+    backend : "legacy" | "kernel"
+        "legacy" (default): the original loop implementation in this
+        file/base.py -- unaffected by this parameter, works with zero
+        extra dependencies.
+        "kernel": delegates invoke()/ainvoke() to autourgos-kernel's
+        Engine/Run instead (requires `pip install autourgos-agent[kernel]`),
+        giving you Run-based state isolation and checkpoint/resume. Opt-in
+        and has a few documented behavioral gaps vs "legacy" -- see
+        autourgos_agent/kernel_backend.py's module docstring before
+        relying on it for anything beyond straightforward tool-calling
+        agents (no mid-run tool exposure, no llm_retries, no on_iteration/
+        on_before_iteration hooks).
     """
 
     MAX_CONSECUTIVE_PARSE_ERRORS: int = 3
@@ -151,12 +163,16 @@ class Agent(AgentLoopMixin, BaseAgent):
         max_scratchpad_chars: Optional[int] = None,
         max_tool_output_chars: Optional[int] = None,
         max_tool_workers: Optional[int] = None,
+        backend: str = "legacy",
     ) -> None:
         if tool_calling_mode not in ("prompt", "native"):
             raise ValueError(
                 f"tool_calling_mode must be 'prompt' or 'native', got {tool_calling_mode!r}."
             )
+        if backend not in ("legacy", "kernel"):
+            raise ValueError(f"backend must be 'legacy' or 'kernel', got {backend!r}.")
         self.tool_calling_mode = tool_calling_mode
+        self.backend = backend
         super().__init__(
             llm=llm,
             memory=memory,
@@ -249,6 +265,12 @@ class Agent(AgentLoopMixin, BaseAgent):
             self.callback_manager.fire_agent_start(query, agent=self)
             self.logger.run_start(query)
 
+            if self.backend == "kernel":
+                from .kernel_backend import invoke_kernel
+                return invoke_kernel(
+                    self, query, max_iterations or self.max_iterations, kwargs
+                )
+
             if self.tool_calling_mode == "native":
                 return self._run_loop_native(
                     query,
@@ -291,6 +313,12 @@ class Agent(AgentLoopMixin, BaseAgent):
 
             self.callback_manager.fire_agent_start(query, agent=self)
             self.logger.run_start(query)
+
+            if self.backend == "kernel":
+                from .kernel_backend import ainvoke_kernel
+                return await ainvoke_kernel(
+                    self, query, max_iterations or self.max_iterations, kwargs
+                )
 
             if self.tool_calling_mode == "native":
                 return await self._arun_loop_native(

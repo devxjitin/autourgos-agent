@@ -1,5 +1,5 @@
 """
-Tests for the @tool decorator in autourgos-react-agent.
+Tests for the @tool decorator in autourgos-agent.
 
 Covers:
   (a) bare @tool usage: schema inference from type hints + docstring

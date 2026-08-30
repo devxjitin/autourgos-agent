@@ -1,5 +1,5 @@
 """
-logging.py -- AgentLogger for autourgos-react-agent.
+logging.py -- AgentLogger for autourgos-agent.
 
 Provides a LangChain-style verbose console trace: a coloured
 "> Starting X..." / "> X finished." banner wrapping the run,

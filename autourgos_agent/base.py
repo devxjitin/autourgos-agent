@@ -1,5 +1,5 @@
 """
-base.py — Self-contained base classes for autourgos-react-agent.
+base.py — Self-contained base classes for autourgos-agent.
 
 Inlines BaseLLM, BaseAgent, AgentLoopMixin, CallbackManager, and all
 protocols so the package has zero dependency on autourgos-core.

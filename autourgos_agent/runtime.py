@@ -1,5 +1,5 @@
 """
-runtime.py — Tool helpers for autourgos-react-agent.
+runtime.py — Tool helpers for autourgos-agent.
 
 build_tool_list   : formats tool dicts into a prompt-ready string
 parse_json_object : extracts the first JSON object from LLM text

@@ -1,5 +1,5 @@
 '''
-tool.py -- @tool decorator for autourgos-react-agent.
+tool.py -- @tool decorator for autourgos-agent.
 
 Lets you define a tool as a plain, type-hinted function instead of hand
 -writing the JSON-Schema dict that Agent.add_tools() expects::

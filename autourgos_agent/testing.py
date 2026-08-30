@@ -1,5 +1,5 @@
 """
-testing.py — Shared test fixture for autourgos-react-agent and its
+testing.py — Shared test fixture for autourgos-agent and its
 sibling middleware packages (hcix, summarizer, preiteration, toolbox, ...).
 
 ``make_test_agent()`` builds a REAL, fully-functional ``Agent`` wired

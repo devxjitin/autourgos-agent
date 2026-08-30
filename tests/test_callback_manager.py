@@ -1,6 +1,6 @@
 """
 Tests for the CallbackManager / CallbackHandler lifecycle in
-autourgos-react-agent.
+autourgos-agent.
 
 Covers:
   (a) all 9/10 hooks fire during a normal run, with `agent=` passed correctly

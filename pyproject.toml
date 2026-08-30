@@ -36,7 +36,7 @@ openaichat = ["autourgos-openaichat>=2.3.1"]
 responses  = ["autourgos-responses>=2.2.1"]
 core       = ["autourgos-core>=0.2.0"]
 kernel     = ["autourgos-kernel>=0.2.1"]
-policy     = ["autourgos-core>=0.2.0", "autourgos-kernel>=0.2.1", "autourgos-policy>=0.3.0"]
+policy     = ["autourgos-core>=0.2.0", "autourgos-kernel>=0.2.1", "autourgos-policy>=0.3.1"]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
@@ -44,7 +44,7 @@ dev = [
     "autourgos-responses>=2.2.1",
     "autourgos-core>=0.2.0",
     "autourgos-kernel>=0.2.1",
-    "autourgos-policy>=0.3.0",
+    "autourgos-policy>=0.3.1",
     "build",
     "twine",
 ]

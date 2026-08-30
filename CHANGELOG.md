@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.5.0
+
+- Added an optional `[core]` extra (`pip install autourgos-agent[core]`)
+  and a soft re-export of `autourgos-core`'s typed vocabulary (`Message`,
+  `RunState`, `Budget`, `ArtifactRef`, `Action`, `Resource`, `Decision`,
+  `Effect`, `Risk`, `ModelResponse`, and `CoreToolCall`/`CoreToolResult`/
+  `CoreToolSpec`) -- only resolves if `autourgos-core` is separately
+  installed, mirroring the `autourgos-memory` family's soft re-export
+  pattern. `autourgos-core` is deliberately **not** a required dependency:
+  this package's zero-required-dependencies design is unchanged, and
+  nothing about `Agent`'s behavior depends on it being present.
+
 ## 2.4.0
 
 - Fixed `async def` tools silently not running under `invoke()` (sync) --

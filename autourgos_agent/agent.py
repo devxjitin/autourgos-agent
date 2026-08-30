@@ -195,6 +195,22 @@ class Agent(AgentLoopMixin, BaseAgent):
             raise ValueError(
                 "capabilities, policy_executor_factory, and max_effects require backend='kernel'."
             )
+        if capabilities and policy_executor_factory is None:
+            # Fail closed, at construction time: capabilities declare risk
+            # precisely so a policy layer can gate them. Without a
+            # policy_executor_factory, autourgos_kernel.Engine would either
+            # raise this same error lazily on invoke() (confusing -- the
+            # agent looked configured, then failed on first use) or, before
+            # that check existed, silently run every capability tool
+            # completely unguarded. Neither is acceptable for something
+            # whose whole purpose is safety gating.
+            raise ValueError(
+                "capabilities were provided but policy_executor_factory was not. "
+                "Capability tools declare risk so a policy layer can gate them -- "
+                "running them without one would execute every capability tool "
+                "call completely unguarded. Pass policy_executor_factory=, or "
+                "drop capabilities= if you only need legacy tools."
+            )
         self.tool_calling_mode = tool_calling_mode
         self.backend = backend
         self.capabilities = list(capabilities or [])

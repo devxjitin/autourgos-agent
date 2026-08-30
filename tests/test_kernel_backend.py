@@ -4,14 +4,25 @@ Tests for Agent(backend="kernel") -- the opt-in bridge to autourgos-kernel
 autourgos_agent/kernel_backend.py's module docstring for the documented
 gaps vs backend="legacy").
 
-These require autourgos-kernel to be installed (pip install
-autourgos-agent[kernel]) -- skipped entirely otherwise, since
+These require autourgos-kernel (and, for the policy-related tests further
+down, autourgos-policy) to be installed (pip install
+autourgos-agent[kernel] / [policy]) -- skipped entirely otherwise, since
 backend="kernel" is optional and must not break `pip install
 autourgos-agent` on its own.
 
 backend="legacy" (the default, tested everywhere else in this suite) is
 untouched by any of this -- these tests exist to verify the *new*, opt-in
 path, not to duplicate the existing 95 tests.
+
+The importorskip() calls below MUST run before anything in this file
+imports from autourgos_core/autourgos_policy -- either of those imports
+succeeding or failing is exactly what determines whether this whole
+module should be collected or skipped. An import above them would turn a
+missing optional dependency into a hard collection error instead of a
+skip (found during review: this previously aborted the ENTIRE pytest run
+with "Interrupted: 1 error during collection" -- zero tests reported,
+not even the unrelated 95 backend="legacy" tests in other files -- the
+moment autourgos-core wasn't installed).
 """
 
 from __future__ import annotations
@@ -19,13 +30,16 @@ from __future__ import annotations
 import json
 
 import pytest
-from autourgos_core import Action, Risk
-from autourgos_policy import PolicyConfig, PolicyExecutor, PolicyGate
-
-from autourgos_agent import Agent, AgentMaxIterationsError, CallbackHandler, tool
-from autourgos_agent.testing import ScriptedFakeLLM, ScriptedToolCallLLM
 
 autourgos_kernel = pytest.importorskip("autourgos_kernel")
+autourgos_core = pytest.importorskip("autourgos_core")
+autourgos_policy = pytest.importorskip("autourgos_policy")
+
+from autourgos_core import Action, Risk  # noqa: E402
+from autourgos_policy import PolicyConfig, PolicyExecutor, PolicyGate  # noqa: E402
+
+from autourgos_agent import Agent, AgentMaxIterationsError, CallbackHandler, tool  # noqa: E402
+from autourgos_agent.testing import ScriptedFakeLLM, ScriptedToolCallLLM  # noqa: E402
 
 
 def _final(text: str) -> str:
@@ -50,6 +64,26 @@ def test_policy_options_are_kernel_only_and_effect_budget_is_validated():
         Agent(llm=llm, capabilities=[])
     with pytest.raises(ValueError, match="max_effects"):
         Agent(llm=llm, backend="kernel", max_effects=-1)
+
+
+def test_capabilities_without_policy_executor_factory_raises_at_construction():
+    """Fail-closed guard found during review: a capability declares risk so
+    a policy layer can gate it -- constructing Agent(capabilities=[...])
+    without policy_executor_factory= must refuse immediately, not silently
+    run every capability tool unguarded on first invoke()."""
+
+    class SomeCapability:
+        name = "x"
+
+        def tools(self):
+            return []
+
+        def describe(self, call):
+            raise NotImplementedError
+
+    llm = ScriptedFakeLLM([_final("x")])
+    with pytest.raises(ValueError, match="policy_executor_factory"):
+        Agent(llm=llm, backend="kernel", capabilities=[SomeCapability()])
 
 
 def test_kernel_backend_final_answer_no_tools():

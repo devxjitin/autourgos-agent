@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.7.1
+
+- **Security fix:** `Agent(backend="kernel", capabilities=[...])` now
+  raises `ValueError` at construction time if `policy_executor_factory=`
+  is not also given, instead of silently accepting the configuration and
+  running every capability tool unguarded on first `invoke()` (matches
+  `autourgos-kernel` 0.2.1's `Engine.run()` fail-closed guard, but fails
+  earlier and with a clearer message since it's checked at construction).
+- Fixed `tests/test_kernel_backend.py` importing `autourgos_core` and
+  `autourgos_policy` (both optional extras) above their
+  `pytest.importorskip()` guards, which turned a missing `autourgos-core`
+  install into a hard collection error for the entire test run
+  ("Interrupted: 1 error during collection", zero tests reported --
+  not even the unrelated 95 `backend="legacy"` tests in other files)
+  instead of a graceful skip of just that file. Requires `autourgos-kernel>=0.2.1`.
+
 ## 2.7.0
 
 - Added kernel-only `capabilities`, `policy_executor_factory`, and

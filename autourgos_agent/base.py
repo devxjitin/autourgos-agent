@@ -18,6 +18,8 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as _FutureTimeoutError
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from .runtime import build_tool_list
+
 _logger = logging.getLogger("autourgos_agent")
 
 
@@ -779,7 +781,6 @@ class AgentLoopMixin:
     def _run_loop(
         self,
         query: str,
-        tool_list_str: str,
         max_iterations: int,
         approval_callback: Optional[Callable[[str, Dict[str, Any]], Any]],
         extra_kwargs: Dict[str, Any],
@@ -787,7 +788,6 @@ class AgentLoopMixin:
         self.scratchpad = ""
         consecutive_parse_errors = 0
         start_time = time.monotonic()
-        tool_map: Dict[str, Any] = {_tool_name(t): t for t in getattr(self, "tools", [])}
         max_parse_errors: int = getattr(self, "max_consecutive_parse_errors",
                                         getattr(self, "MAX_CONSECUTIVE_PARSE_ERRORS", 3))
         max_exec_time: Optional[float] = getattr(self, "max_execution_time", None)
@@ -805,9 +805,17 @@ class AgentLoopMixin:
             if max_exec_time and (time.monotonic() - start_time) > max_exec_time:
                 raise AgentTimeoutError(max_exec_time)
 
+            # Rebuild from self.tools every iteration (not once before the loop)
+            # so a tool added mid-run (e.g. autourgos-toolbox's expose_toolbox())
+            # is both advertised to the LLM and actually callable on the very
+            # next iteration -- a stale snapshot here silently made every such
+            # middleware's "expose more tools mid-run" feature never work.
+            current_tools = getattr(self, "tools", [])
+            tool_map: Dict[str, Any] = {_tool_name(t): t for t in current_tools}
+
             # render prompt
             prompt_text = template.format(
-                tool_list=tool_list_str,
+                tool_list=build_tool_list(current_tools),
                 previous_context=self.scratchpad or "None",
                 user_input=query,
                 memory_context=memory_context,
@@ -937,7 +945,6 @@ class AgentLoopMixin:
     async def _arun_loop(
         self,
         query: str,
-        tool_list_str: str,
         max_iterations: int,
         approval_callback: Optional[Callable[[str, Dict[str, Any]], Any]],
         extra_kwargs: Dict[str, Any],
@@ -945,7 +952,6 @@ class AgentLoopMixin:
         self.scratchpad = ""
         consecutive_parse_errors = 0
         start_time = time.monotonic()
-        tool_map: Dict[str, Any] = {_tool_name(t): t for t in getattr(self, "tools", [])}
         max_parse_errors: int = getattr(self, "max_consecutive_parse_errors",
                                         getattr(self, "MAX_CONSECUTIVE_PARSE_ERRORS", 3))
         max_exec_time: Optional[float] = getattr(self, "max_execution_time", None)
@@ -962,8 +968,13 @@ class AgentLoopMixin:
             if max_exec_time and (time.monotonic() - start_time) > max_exec_time:
                 raise AgentTimeoutError(max_exec_time)
 
+            # See _run_loop's identical comment: rebuilt every iteration so a
+            # tool added mid-run is actually callable on the next iteration.
+            current_tools = getattr(self, "tools", [])
+            tool_map: Dict[str, Any] = {_tool_name(t): t for t in current_tools}
+
             prompt_text = template.format(
-                tool_list=tool_list_str,
+                tool_list=build_tool_list(current_tools),
                 previous_context=self.scratchpad or "None",
                 user_input=query,
                 memory_context=memory_context,
@@ -1191,7 +1202,6 @@ class AgentLoopMixin:
         self.scratchpad = ""
         consecutive_empty = 0
         start_time = time.monotonic()
-        tool_map: Dict[str, Any] = {_tool_name(t): t for t in getattr(self, "tools", [])}
         max_empty: int = getattr(self, "max_consecutive_parse_errors",
                                   getattr(self, "MAX_CONSECUTIVE_PARSE_ERRORS", 3))
         max_exec_time: Optional[float] = getattr(self, "max_execution_time", None)
@@ -1206,6 +1216,14 @@ class AgentLoopMixin:
 
             if max_exec_time and (time.monotonic() - start_time) > max_exec_time:
                 raise AgentTimeoutError(max_exec_time)
+
+            # Rebuilt every iteration -- see _run_loop's identical comment.
+            # self.tools is already passed live to invoke_with_tools() below,
+            # but tool_map (used to actually execute an approved call further
+            # down) was previously frozen once before the loop, so a tool
+            # exposed mid-run could be advertised to the LLM yet still fail
+            # with "not found" the moment it tried to call it.
+            tool_map: Dict[str, Any] = {_tool_name(t): t for t in getattr(self, "tools", [])}
 
             call_kwargs = {**extra_kwargs, **iteration_extra_kwargs}
             try:
@@ -1285,7 +1303,6 @@ class AgentLoopMixin:
         self.scratchpad = ""
         consecutive_empty = 0
         start_time = time.monotonic()
-        tool_map: Dict[str, Any] = {_tool_name(t): t for t in getattr(self, "tools", [])}
         max_empty: int = getattr(self, "max_consecutive_parse_errors",
                                   getattr(self, "MAX_CONSECUTIVE_PARSE_ERRORS", 3))
         max_exec_time: Optional[float] = getattr(self, "max_execution_time", None)
@@ -1300,6 +1317,9 @@ class AgentLoopMixin:
 
             if max_exec_time and (time.monotonic() - start_time) > max_exec_time:
                 raise AgentTimeoutError(max_exec_time)
+
+            # Rebuilt every iteration -- see _run_loop_native's identical comment.
+            tool_map: Dict[str, Any] = {_tool_name(t): t for t in getattr(self, "tools", [])}
 
             call_kwargs = {**extra_kwargs, **iteration_extra_kwargs}
             try:

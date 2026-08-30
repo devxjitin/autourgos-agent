@@ -29,7 +29,7 @@ from typing import Any, Callable, Dict, List, Optional
 from .base    import AgentLoopMixin, BaseAgent, BaseLLM, CallbackHandler, MemoryProtocol
 from .logging import AgentLogger
 from .prompt  import PREFIX_PROMPT, LOGIC_PROMPT, SUFFIX_PROMPT
-from .runtime import build_tool_list, parse_json_object
+from .runtime import parse_json_object
 
 
 class Agent(AgentLoopMixin, BaseAgent):
@@ -245,7 +245,6 @@ class Agent(AgentLoopMixin, BaseAgent):
                 )
             return self._run_loop(
                 query,
-                build_tool_list(self.tools),
                 max_iterations=max_iterations or self.max_iterations,
                 approval_callback=self.approval_callback,
                 extra_kwargs=kwargs,
@@ -291,7 +290,6 @@ class Agent(AgentLoopMixin, BaseAgent):
                 )
             return await self._arun_loop(
                 query,
-                build_tool_list(self.tools),
                 max_iterations=max_iterations or self.max_iterations,
                 approval_callback=self.approval_callback,
                 extra_kwargs=kwargs,

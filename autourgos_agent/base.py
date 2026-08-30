@@ -311,6 +311,55 @@ def _record_agent_message(memory: Any, message: str) -> None:
         )
 
 
+def _get_memory_context(memory: Any, query: str) -> str:
+    """Best-effort retrieval of prior conversation history from ``memory``,
+    to actually feed it back into the prompt/messages the LLM sees.
+
+    Tolerates two different, incompatible conventions that exist across the
+    Autourgos ecosystem: the autourgos-memory family's ``BaseMemory``
+    (``format_for_llm()``/legacy ``get_context()``) and this package's own
+    ``MemoryProtocol`` (``get_history()`` -> list of ``{role, content}``
+    dicts, per the README's hand-rolled memory example). Without this, a
+    memory object only ever gets written to (add_user_message/
+    add_agent_message) and never read back, so the agent could never
+    actually recall anything from it.
+    """
+    if memory is None:
+        return ""
+
+    fmt = getattr(memory, "format_for_llm", None)
+    if callable(fmt):
+        try:
+            return fmt(query) or ""
+        except TypeError:
+            return fmt() or ""
+
+    ctx = getattr(memory, "get_context", None)
+    if callable(ctx):
+        try:
+            return ctx(query) or ""
+        except TypeError:
+            return ctx() or ""
+
+    history_fn = getattr(memory, "get_history", None)
+    if callable(history_fn):
+        history = history_fn() or []
+        if not history:
+            return ""
+        rendered: List[str] = []
+        for m in history:
+            if isinstance(m, dict):
+                rendered.append(f"{m.get('role', '')}: {m.get('content', '')}")
+            elif isinstance(m, (tuple, list)) and len(m) == 2:
+                rendered.append(f"{m[0]}: {m[1]}")
+            else:
+                rendered.append(str(m))
+        lines = "\n".join(rendered)
+        return f"\n--- Previous Conversation Context ---\n{lines}\n--------------------------------------\n"
+
+    return ""
+
+
 # ── CallbackManager ────────────────────────────────────────────────────────────
 
 class CallbackManager:
@@ -746,6 +795,7 @@ class AgentLoopMixin:
         template: str = getattr(self, "prompt_template", "")
         logger = getattr(self, "logger", None)
         cb: CallbackManager = getattr(self, "callback_manager", CallbackManager())
+        memory_context = _get_memory_context(getattr(self, "memory", None), query)
 
         for iteration in range(1, max_iterations + 1):
             cb.fire_iteration_start(iteration, agent=self)
@@ -760,6 +810,7 @@ class AgentLoopMixin:
                 tool_list=tool_list_str,
                 previous_context=self.scratchpad or "None",
                 user_input=query,
+                memory_context=memory_context,
             )
             messages = self._build_messages(prompt_text)
 
@@ -902,6 +953,7 @@ class AgentLoopMixin:
         template: str = getattr(self, "prompt_template", "")
         logger = getattr(self, "logger", None)
         cb: CallbackManager = getattr(self, "callback_manager", CallbackManager())
+        memory_context = _get_memory_context(getattr(self, "memory", None), query)
 
         for iteration in range(1, max_iterations + 1):
             cb.fire_iteration_start(iteration, agent=self)
@@ -914,6 +966,7 @@ class AgentLoopMixin:
                 tool_list=tool_list_str,
                 previous_context=self.scratchpad or "None",
                 user_input=query,
+                memory_context=memory_context,
             )
             messages = self._build_messages(prompt_text)
 
@@ -1017,11 +1070,13 @@ class AgentLoopMixin:
     # date (human-readable trace only, not fed back to the LLM) so middleware
     # relying on the scratchpad contract still sees something sensible.
 
-    def _build_native_messages(self, query: str) -> List[Dict[str, Any]]:
+    def _build_native_messages(self, query: str, memory_context: str = "") -> List[Dict[str, Any]]:
         system_prompt: str = getattr(self, "system_prompt", "")
         messages: List[Dict[str, Any]] = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
+        if memory_context:
+            messages.append({"role": "system", "content": memory_context})
         messages.append({"role": "user", "content": query})
         return messages
 
@@ -1143,7 +1198,7 @@ class AgentLoopMixin:
         tool_timeout: Optional[float] = getattr(self, "tool_timeout", None)
         logger = getattr(self, "logger", None)
         cb: CallbackManager = getattr(self, "callback_manager", CallbackManager())
-        messages = self._build_native_messages(query)
+        messages = self._build_native_messages(query, _get_memory_context(getattr(self, "memory", None), query))
 
         for iteration in range(1, max_iterations + 1):
             cb.fire_iteration_start(iteration, agent=self)
@@ -1237,7 +1292,7 @@ class AgentLoopMixin:
         tool_timeout: Optional[float] = getattr(self, "tool_timeout", None)
         logger = getattr(self, "logger", None)
         cb: CallbackManager = getattr(self, "callback_manager", CallbackManager())
-        messages = self._build_native_messages(query)
+        messages = self._build_native_messages(query, _get_memory_context(getattr(self, "memory", None), query))
 
         for iteration in range(1, max_iterations + 1):
             cb.fire_iteration_start(iteration, agent=self)

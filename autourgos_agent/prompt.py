@@ -20,7 +20,7 @@ Rules:
 - Never provide both a non-empty "actions" array and a non-null "final_answer" at the same time.
 - Always include a brief "thought" explaining your reasoning for this step.
 
-Context: {previous_context}
+{memory_context}Context: {previous_context}
 Question: {user_input}"""
 
 SUFFIX_PROMPT = ""  # Reserved for future post-instruction text.

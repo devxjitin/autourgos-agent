@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autourgos-agent"
+version = "2.0.2"
+description = "Self-contained, general-purpose LLM agent for the Autourgos framework — works with any OpenAI-compatible LLM"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Jitin Kumar Sengar", email = "devxjitin@gmail.com" },
+]
+keywords = [
+    "autourgos", "agent", "reasoning", "acting",
+    "openai", "llm", "ai", "tool-calling", "autonomous",
+    "groq", "ollama", "mistral",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+openaichat = ["autourgos-openaichat>=2.3.1"]
+responses  = ["autourgos-responses>=2.2.1"]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "autourgos-openaichat>=2.3.1",
+    "autourgos-responses>=2.2.1",
+    "build",
+    "twine",
+]
+
+[project.urls]
+Homepage   = "https://github.com/devxjitin/autourgos-agent"
+Repository = "https://github.com/devxjitin/autourgos-agent"
+Issues     = "https://github.com/devxjitin/autourgos-agent/issues"
+
+[tool.setuptools.packages.find]
+where   = ["."]
+include = ["autourgos_agent*"]
+
+[tool.setuptools.package-data]
+autourgos_agent = ["py.typed"]

@@ -855,6 +855,29 @@ You can also override `max_iterations` per call:
 result = agent.invoke("Quick question: capital of Japan?", max_iterations=3)
 ```
 
+`max_execution_time` alone can't stop a *single* tool call from hanging forever
+— it's only checked between iterations, not while a tool call is in flight.
+Use `tool_timeout` for that:
+
+```python
+agent = Agent(
+    llm=OpenAIChatModel(model="gpt-4o"),
+    tool_timeout=10.0,  # abandon any single tool call that runs past 10s
+)
+agent.add_tools(flaky_network_tool)
+
+result = agent.invoke("Fetch the data and summarize it.")
+# If flaky_network_tool hangs, its Observation becomes:
+# "Error: tool 'flaky_network_tool' timed out after 10.0s."
+# instead of blocking the agent loop forever.
+```
+
+A timed-out sync tool's underlying thread keeps running in the background
+(Python has no way to force-stop a running thread) — the agent loop itself
+just stops waiting on it. An async tool is actually cancelled at its next
+`await` point. `tool_timeout=None` (the default) disables this and matches
+prior behavior.
+
 ---
 
 ## Custom System Prompt
@@ -886,6 +909,7 @@ result = agent.invoke("What is the P/E ratio of Apple?")
 | `memory` | `MemoryProtocol` | `None` | Memory backend for conversation history |
 | `max_iterations` | `int` | `15` | Max Thought → Action → Observe cycles before stopping |
 | `max_execution_time` | `float` | `None` | Wall-clock time limit in seconds |
+| `tool_timeout` | `float` | `None` | Per-tool-call timeout in seconds. See [Time and Iteration Limits](#time-and-iteration-limits) |
 | `approval_callback` | `callable` | `None` | Called as `fn(tool_name, tool_input)` before each tool. Return truthy to allow |
 | `middleware` | `list[CallbackHandler]` | `None` | Event hooks for lifecycle events |
 | `max_consecutive_parse_errors` | `int` | `3` | Stop after this many back-to-back JSON parse failures |

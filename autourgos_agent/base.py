@@ -15,6 +15,7 @@ import re
 import time
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as _FutureTimeoutError
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 _logger = logging.getLogger("autourgos_agent")
@@ -546,6 +547,49 @@ class AgentLoopMixin:
 
         return result
 
+    def _collect_future_result(self, tool_name: str, future: Any, timeout: Optional[float]) -> str:
+        """Block on a submitted tool future, enforcing ``tool_timeout``.
+
+        Without a timeout here, a hung tool call (e.g. a network request
+        with no timeout of its own) blocks ``future.result()`` forever --
+        ``max_execution_time`` can't save you, since it's only ever checked
+        at the *start* of an iteration, not while a tool call is in flight.
+        A timed-out future's underlying thread is NOT killed (Python has no
+        way to force-stop a running thread) -- it keeps running in the
+        background until it finishes or the process exits -- but the agent
+        loop itself is no longer blocked on it.
+        """
+        try:
+            return future.result(timeout=timeout)
+        except _FutureTimeoutError:
+            result = f"Error: tool '{tool_name}' timed out after {timeout}s."
+            cb: CallbackManager = getattr(self, "callback_manager", None)
+            if cb:
+                cb.fire_tool_error(tool_name, TimeoutError(result), agent=self)
+            return result
+
+    async def _execute_tool_async_with_timeout(
+        self, tool_map: Dict[str, Any], tool_name: str, tool_input: Any, timeout: Optional[float]
+    ) -> str:
+        """Async twin of _collect_future_result -- wraps _execute_tool_async in
+        asyncio.wait_for so a hung async tool doesn't block the loop forever.
+        For a genuinely async tool func, wait_for can actually cancel it at
+        its next await point; for a blocking sync tool func, this can only
+        raise once the underlying call returns (asyncio can't preempt a
+        running sync frame), same fundamental limit as anywhere else a sync
+        function runs inside an event loop.
+        """
+        try:
+            return await asyncio.wait_for(
+                self._execute_tool_async(tool_map, tool_name, tool_input), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            result = f"Error: tool '{tool_name}' timed out after {timeout}s."
+            cb: CallbackManager = getattr(self, "callback_manager", None)
+            if cb:
+                cb.fire_tool_error(tool_name, TimeoutError(result), agent=self)
+            return result
+
     def _trim_scratchpad(self, scratchpad: str) -> str:
         max_chars: int = getattr(self, "MAX_SCRATCHPAD_CHARS", 15000)
         if len(scratchpad) > max_chars:
@@ -569,6 +613,7 @@ class AgentLoopMixin:
         max_parse_errors: int = getattr(self, "max_consecutive_parse_errors",
                                         getattr(self, "MAX_CONSECUTIVE_PARSE_ERRORS", 3))
         max_exec_time: Optional[float] = getattr(self, "max_execution_time", None)
+        tool_timeout: Optional[float] = getattr(self, "tool_timeout", None)
         template: str = getattr(self, "prompt_template", "")
         logger = getattr(self, "logger", None)
         cb: CallbackManager = getattr(self, "callback_manager", CallbackManager())
@@ -679,18 +724,28 @@ class AgentLoopMixin:
 
             if approved:
                 max_workers = min(len(approved), getattr(self, "MAX_TOOL_WORKERS", 8))
-                with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                # Not a `with` block: ThreadPoolExecutor.__exit__ calls
+                # shutdown(wait=True), which blocks until every submitted
+                # thread finishes -- including one _collect_future_result
+                # already gave up on via tool_timeout. shutdown(wait=False)
+                # lets the loop move on immediately; the timed-out thread
+                # (if any) is abandoned to finish on its own, same as
+                # documented on _collect_future_result.
+                pool = ThreadPoolExecutor(max_workers=max_workers)
+                try:
                     futures = [
                         (tool_name, tool_input, pool.submit(self._execute_tool, tool_map, tool_name, tool_input))
                         for tool_name, tool_input in approved
                     ]
                     for tool_name, tool_input, future in futures:
-                        result = future.result()
+                        result = self._collect_future_result(tool_name, future, tool_timeout)
                         cb.fire_tool_end(tool_name, result, agent=self)
                         if logger:
                             logger.tool_result(tool_name, result, iteration)
                         step_lines.append(f"Action: {tool_name}({tool_input})")
                         step_lines.append(f"Observation: {result}")
+                finally:
+                    pool.shutdown(wait=False)
 
             self.scratchpad += "\n".join(step_lines)
             self.scratchpad = self._trim_scratchpad(self.scratchpad)
@@ -714,6 +769,7 @@ class AgentLoopMixin:
         max_parse_errors: int = getattr(self, "max_consecutive_parse_errors",
                                         getattr(self, "MAX_CONSECUTIVE_PARSE_ERRORS", 3))
         max_exec_time: Optional[float] = getattr(self, "max_execution_time", None)
+        tool_timeout: Optional[float] = getattr(self, "tool_timeout", None)
         template: str = getattr(self, "prompt_template", "")
         logger = getattr(self, "logger", None)
         cb: CallbackManager = getattr(self, "callback_manager", CallbackManager())
@@ -809,7 +865,8 @@ class AgentLoopMixin:
 
             if approved:
                 results = await asyncio.gather(*[
-                    self._execute_tool_async(tool_map, tool_name, tool_input) for tool_name, tool_input in approved
+                    self._execute_tool_async_with_timeout(tool_map, tool_name, tool_input, tool_timeout)
+                    for tool_name, tool_input in approved
                 ])
                 for (tool_name, tool_input), result in zip(approved, results):
                     cb.fire_tool_end(tool_name, result, agent=self)
@@ -954,6 +1011,7 @@ class AgentLoopMixin:
         max_empty: int = getattr(self, "max_consecutive_parse_errors",
                                   getattr(self, "MAX_CONSECUTIVE_PARSE_ERRORS", 3))
         max_exec_time: Optional[float] = getattr(self, "max_execution_time", None)
+        tool_timeout: Optional[float] = getattr(self, "tool_timeout", None)
         logger = getattr(self, "logger", None)
         cb: CallbackManager = getattr(self, "callback_manager", CallbackManager())
         messages = self._build_native_messages(query)
@@ -1007,14 +1065,20 @@ class AgentLoopMixin:
 
             if approved:
                 max_workers = min(len(approved), getattr(self, "MAX_TOOL_WORKERS", 8))
-                with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                # Not a `with` block -- see the identical note in _run_loop:
+                # shutdown(wait=True) on __exit__ would block on a thread
+                # _collect_future_result already gave up on via tool_timeout.
+                pool = ThreadPoolExecutor(max_workers=max_workers)
+                try:
                     futures = [(tc, pool.submit(self._execute_tool, tool_map, tc.name, tc.arguments)) for tc in approved]
                     for tc, future in futures:
-                        result = future.result()
+                        result = self._collect_future_result(tc.name, future, tool_timeout)
                         cb.fire_tool_end(tc.name, result, agent=self)
                         if logger:
                             logger.tool_result(tc.name, result, iteration)
                         calls_and_results.append((tc, result))
+                finally:
+                    pool.shutdown(wait=False)
 
             results_by_call_id = {tc.call_id: result for tc, result in calls_and_results}
             for tc in response.tool_calls:
@@ -1039,6 +1103,7 @@ class AgentLoopMixin:
         max_empty: int = getattr(self, "max_consecutive_parse_errors",
                                   getattr(self, "MAX_CONSECUTIVE_PARSE_ERRORS", 3))
         max_exec_time: Optional[float] = getattr(self, "max_execution_time", None)
+        tool_timeout: Optional[float] = getattr(self, "tool_timeout", None)
         logger = getattr(self, "logger", None)
         cb: CallbackManager = getattr(self, "callback_manager", CallbackManager())
         messages = self._build_native_messages(query)
@@ -1092,7 +1157,8 @@ class AgentLoopMixin:
 
             if approved:
                 results = await asyncio.gather(*[
-                    self._execute_tool_async(tool_map, tc.name, tc.arguments) for tc in approved
+                    self._execute_tool_async_with_timeout(tool_map, tc.name, tc.arguments, tool_timeout)
+                    for tc in approved
                 ])
                 for tc, result in zip(approved, results):
                     cb.fire_tool_end(tc.name, result, agent=self)

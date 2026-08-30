@@ -51,6 +51,15 @@ class Agent(AgentLoopMixin, BaseAgent):
         Hard limit on the number of Thought → Action → Observation steps.
     max_execution_time : float, optional
         Wall-clock time limit in seconds. Agent stops when exceeded.
+    tool_timeout : float, optional
+        Per-tool-call timeout in seconds. If a single tool call runs longer
+        than this, it's abandoned and treated as an error Observation
+        instead of blocking the agent loop forever -- max_execution_time
+        alone can't catch this, since it's only checked between iterations,
+        not while a tool call is in flight. A timed-out sync tool's thread
+        keeps running in the background (Python can't force-stop a thread);
+        an async tool is actually cancelled at its next await point.
+        None (default) disables the timeout, matching prior behavior.
     approval_callback : callable, optional
         Called before each tool execution as approval_callback(tool_name, tool_input).
         Return a truthy value to allow, falsy to deny.
@@ -91,6 +100,7 @@ class Agent(AgentLoopMixin, BaseAgent):
         memory: Optional[MemoryProtocol] = None,
         max_iterations: int = 15,
         max_execution_time: Optional[float] = None,
+        tool_timeout: Optional[float] = None,
         approval_callback: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
         middleware: Optional[List[CallbackHandler]] = None,
         max_consecutive_parse_errors: int = 3,
@@ -113,6 +123,7 @@ class Agent(AgentLoopMixin, BaseAgent):
             tools=tools,
         )
         self.full_output  = full_output
+        self.tool_timeout = tool_timeout
         self.approval_callback = approval_callback
         self.max_consecutive_parse_errors = max_consecutive_parse_errors
         self.system_prompt   = system_prompt

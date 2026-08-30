@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.1.0
+
+- Added `tool_timeout` (seconds, default `None`): a per-tool-call timeout that
+  `max_execution_time` couldn't provide on its own, since that guard is only
+  checked between loop iterations — a single hanging tool call (e.g. a
+  network request with no timeout of its own) could block the agent loop
+  forever regardless of `max_execution_time`. A timed-out call now becomes an
+  error Observation (`"Error: tool '<name>' timed out after <n>s."`) and
+  fires `on_tool_error`, instead of hanging. Applies in both `invoke()` and
+  `ainvoke()`, and in both `tool_calling_mode="prompt"` and `"native"`.
+- Fixed: the sync loops' `with ThreadPoolExecutor(...) as pool:` block was
+  itself blocking on exit — `ThreadPoolExecutor.__exit__` calls
+  `shutdown(wait=True)`, which waits for every submitted thread to finish,
+  including one a tool-call timeout had already given up on. Replaced with
+  explicit `pool.shutdown(wait=False)` so a timed-out tool call actually lets
+  the loop move on immediately instead of blocking for the same duration
+  anyway once the pool went out of scope.
+
 ## 2.0.2
 
 - Fixed `tool_calling_mode="prompt"` (`_run_loop`/`_arun_loop`) not firing `on_tool_end` when `approval_callback` denies a tool call — only `on_tool_start` fired, so start/end-pairing middleware (metrics, tracing spans) never saw the call close. `tool_calling_mode="native"` already fired both; prompt mode now matches it.

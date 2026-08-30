@@ -60,6 +60,20 @@ class Agent(AgentLoopMixin, BaseAgent):
         keeps running in the background (Python can't force-stop a thread);
         an async tool is actually cancelled at its next await point.
         None (default) disables the timeout, matching prior behavior.
+    max_scratchpad_tokens : int, optional
+        Extra scratchpad budget on top of MAX_SCRATCHPAD_CHARS, measured in
+        tokens instead of characters. Character count alone is a poor proxy
+        for what actually overflows an LLM's context window -- tokens per
+        character varies a lot by language and content (dense non-English
+        text or code often runs well under the ~4 chars/token used for the
+        default estimate). None (default) disables this and only the
+        character cap applies, matching prior behavior.
+    token_counter : callable, optional
+        `fn(text: str) -> int` used to count tokens when max_scratchpad_tokens
+        is set. Defaults to a rough len(text) // 4 approximation. Pass a real
+        tokenizer for accuracy, e.g.
+        `token_counter=lambda t: len(tiktoken.encoding_for_model(model).encode(t))`.
+        Ignored if max_scratchpad_tokens is None.
     approval_callback : callable, optional
         Called before each tool execution as approval_callback(tool_name, tool_input).
         Return a truthy value to allow, falsy to deny.
@@ -101,6 +115,8 @@ class Agent(AgentLoopMixin, BaseAgent):
         max_iterations: int = 15,
         max_execution_time: Optional[float] = None,
         tool_timeout: Optional[float] = None,
+        max_scratchpad_tokens: Optional[int] = None,
+        token_counter: Optional[Callable[[str], int]] = None,
         approval_callback: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
         middleware: Optional[List[CallbackHandler]] = None,
         max_consecutive_parse_errors: int = 3,
@@ -124,6 +140,8 @@ class Agent(AgentLoopMixin, BaseAgent):
         )
         self.full_output  = full_output
         self.tool_timeout = tool_timeout
+        self.max_scratchpad_tokens = max_scratchpad_tokens
+        self.token_counter = token_counter
         self.approval_callback = approval_callback
         self.max_consecutive_parse_errors = max_consecutive_parse_errors
         self.system_prompt   = system_prompt

@@ -62,6 +62,7 @@ This continues until the agent has a final answer or hits the iteration/time lim
 - [Testing](#testing)
 - [Context Manager](#context-manager)
 - [Time and Iteration Limits](#time-and-iteration-limits)
+- [Scratchpad Size Limits](#scratchpad-size-limits)
 - [Custom System Prompt](#custom-system-prompt)
 - [Constructor Reference](#constructor-reference)
 - [Tool Dict Reference](#tool-dict-reference)
@@ -880,6 +881,48 @@ prior behavior.
 
 ---
 
+## Scratchpad Size Limits
+
+The scratchpad (`agent.scratchpad`, `"prompt"` mode only) is capped at
+`Agent.MAX_SCRATCHPAD_CHARS` (15,000 characters) by default — once exceeded,
+older steps are trimmed from the front and replaced with
+`"[...earlier steps trimmed...]"`.
+
+Character count alone is a poor proxy for what actually overflows an LLM's
+context window: tokens per character varies a lot by language and content
+(dense non-English text or code can run well under the ~4 chars/token rule
+of thumb, silently blowing a char-only budget's whole point long before
+15,000 characters is reached). `max_scratchpad_tokens` adds a second,
+token-based cap on top of the character one:
+
+```python
+agent = Agent(
+    llm=OpenAIChatModel(model="gpt-4o"),
+    max_scratchpad_tokens=4000,  # trim further if the scratchpad exceeds ~4000 tokens
+)
+```
+
+Without a real tokenizer, token count is approximated as `len(text) // 4`
+(the common English-prose rule of thumb). Pass `token_counter=` for
+precision — any `fn(text: str) -> int`, e.g.:
+
+```python
+import tiktoken
+
+encoding = tiktoken.encoding_for_model("gpt-4o")
+
+agent = Agent(
+    llm=OpenAIChatModel(model="gpt-4o"),
+    max_scratchpad_tokens=4000,
+    token_counter=lambda text: len(encoding.encode(text)),
+)
+```
+
+`max_scratchpad_tokens=None` (the default) disables the token-based check —
+only the character cap applies, matching prior behavior.
+
+---
+
 ## Custom System Prompt
 
 Add extra instructions that persist across all steps.
@@ -910,6 +953,8 @@ result = agent.invoke("What is the P/E ratio of Apple?")
 | `max_iterations` | `int` | `15` | Max Thought → Action → Observe cycles before stopping |
 | `max_execution_time` | `float` | `None` | Wall-clock time limit in seconds |
 | `tool_timeout` | `float` | `None` | Per-tool-call timeout in seconds. See [Time and Iteration Limits](#time-and-iteration-limits) |
+| `max_scratchpad_tokens` | `int` | `None` | Extra token-based scratchpad budget on top of `MAX_SCRATCHPAD_CHARS`. See [Scratchpad Size Limits](#scratchpad-size-limits) |
+| `token_counter` | `callable` | `None` | `fn(text) -> int` used to count tokens for `max_scratchpad_tokens`. Defaults to a `len(text) // 4` approximation |
 | `approval_callback` | `callable` | `None` | Called as `fn(tool_name, tool_input)` before each tool. Return truthy to allow |
 | `middleware` | `list[CallbackHandler]` | `None` | Event hooks for lifecycle events |
 | `max_consecutive_parse_errors` | `int` | `3` | Stop after this many back-to-back JSON parse failures |

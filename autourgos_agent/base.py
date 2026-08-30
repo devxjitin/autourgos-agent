@@ -241,6 +241,50 @@ def _tool_func(tool: Any) -> Optional[Callable[..., Any]]:
     return getattr(tool, "func", None) or getattr(tool, "function", None)
 
 
+def _default_token_counter(text: str) -> int:
+    """Rough token-count approximation (~4 chars/token, the common rule of
+    thumb for English text) used when max_scratchpad_tokens is set but no
+    real tokenizer was supplied via token_counter=. This is a soft-budget
+    guard, not exact -- pass e.g. `token_counter=lambda t:
+    len(tiktoken.encoding_for_model(model).encode(t))` for precision,
+    especially for non-English text or code, where chars-per-token can
+    differ a lot from the English-prose rule of thumb this falls back to.
+    """
+    return max(1, len(text) // 4)
+
+
+def _trim_to_token_budget(text: str, max_tokens: int, counter: Callable[[str], int]) -> str:
+    """Binary-search the longest tail of `text` whose token count (per
+    `counter`) fits in `max_tokens` once the "[...earlier steps
+    trimmed...]" prefix is accounted for, and return prefix + that tail.
+
+    Binary search (not a linear scan) because `counter` may be a real
+    tokenizer call, not just len() -- O(log n) calls keeps this cheap even
+    for a large scratchpad. Token count isn't guaranteed strictly
+    monotonic in string length for every possible tokenizer (a cut can
+    occasionally merge/split a token differently), so this can be off by a
+    token or two at the boundary -- acceptable for a soft trim guard, and
+    the search still converges since it's monotonic enough in practice for
+    real tokenizers and for the default char-based approximation.
+    """
+    prefix = "[...earlier steps trimmed...]\n"
+    prefix_tokens = counter(prefix)
+    if prefix_tokens >= max_tokens:
+        return prefix
+
+    budget = max_tokens - prefix_tokens
+    lo, hi, best = 0, len(text), 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if counter(text[-mid:]) <= budget:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    return prefix + text[-best:] if best else prefix
+
+
 def _record_agent_message(memory: Any, message: str) -> None:
     """Store the agent's final answer in ``memory``, tolerating either the
     canonical ``add_agent_message`` (autourgos-memory family) or the legacy
@@ -591,9 +635,23 @@ class AgentLoopMixin:
             return result
 
     def _trim_scratchpad(self, scratchpad: str) -> str:
+        """Trim the scratchpad to fit both the character cap (MAX_SCRATCHPAD_CHARS,
+        always active) and, if set, a token budget (max_scratchpad_tokens) --
+        char count alone is a poor proxy for what actually overflows an LLM's
+        context window, since tokens-per-char varies a lot by language and
+        content (dense non-English text or code can run well under 4
+        chars/token, silently blowing a char-only budget's whole point).
+        """
         max_chars: int = getattr(self, "MAX_SCRATCHPAD_CHARS", 15000)
         if len(scratchpad) > max_chars:
-            return "[...earlier steps trimmed...]\n" + scratchpad[-max_chars:]
+            scratchpad = "[...earlier steps trimmed...]\n" + scratchpad[-max_chars:]
+
+        max_tokens: Optional[int] = getattr(self, "max_scratchpad_tokens", None)
+        if max_tokens is not None:
+            counter: Callable[[str], int] = getattr(self, "token_counter", None) or _default_token_counter
+            if counter(scratchpad) > max_tokens:
+                scratchpad = _trim_to_token_budget(scratchpad, max_tokens, counter)
+
         return scratchpad
 
     # ── sync loop ─────────────────────────────────────────────────────────────

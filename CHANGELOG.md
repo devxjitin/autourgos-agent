@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.2.0
+
+- Added `max_scratchpad_tokens` and `token_counter` (both default `None`): a
+  token-based scratchpad budget on top of the existing character-based
+  `MAX_SCRATCHPAD_CHARS`. Character count alone is a poor proxy for what
+  actually overflows an LLM's context window — tokens per character varies a
+  lot by language and content, so dense non-English text or code can blow a
+  char-only budget's whole point long before the character cap trips.
+  `token_counter` lets you plug in a real tokenizer (e.g. `tiktoken`); it
+  defaults to a `len(text) // 4` approximation when not set. Both are no-ops
+  unless `max_scratchpad_tokens` is set, matching prior behavior.
+
 ## 2.1.0
 
 - Added `tool_timeout` (seconds, default `None`): a per-tool-call timeout that

@@ -114,6 +114,12 @@ class Agent(AgentLoopMixin, BaseAgent):
         model's reasoning text isn't available when it also calls tools in
         the same turn (the wrapper doesn't currently return both), so
         Thought callbacks/logging are only fired on the final answer.
+    max_scratchpad_chars : int, optional
+        Per-instance override of MAX_SCRATCHPAD_CHARS (class default 15,000).
+    max_tool_output_chars : int, optional
+        Per-instance override of MAX_TOOL_OUTPUT_CHARS (class default 5,000).
+    max_tool_workers : int, optional
+        Per-instance override of MAX_TOOL_WORKERS (class default 8).
     """
 
     MAX_CONSECUTIVE_PARSE_ERRORS: int = 3
@@ -142,6 +148,9 @@ class Agent(AgentLoopMixin, BaseAgent):
         tools: Optional[List[Any]] = None,
         system_prompt: str = "",
         tool_calling_mode: str = "prompt",
+        max_scratchpad_chars: Optional[int] = None,
+        max_tool_output_chars: Optional[int] = None,
+        max_tool_workers: Optional[int] = None,
     ) -> None:
         if tool_calling_mode not in ("prompt", "native"):
             raise ValueError(
@@ -169,6 +178,12 @@ class Agent(AgentLoopMixin, BaseAgent):
         self.max_consecutive_parse_errors = max_consecutive_parse_errors
         self.system_prompt   = system_prompt
         self.prompt_template = PREFIX_PROMPT + LOGIC_PROMPT + SUFFIX_PROMPT
+        if max_scratchpad_chars is not None:
+            self.MAX_SCRATCHPAD_CHARS = max_scratchpad_chars
+        if max_tool_output_chars is not None:
+            self.MAX_TOOL_OUTPUT_CHARS = max_tool_output_chars
+        if max_tool_workers is not None:
+            self.MAX_TOOL_WORKERS = max_tool_workers
         self.logger = AgentLogger(
             verbose=verbose,
             agent_name="Agent",
@@ -223,8 +238,6 @@ class Agent(AgentLoopMixin, BaseAgent):
         """
         if not self.llm:
             raise ValueError("No LLM provided. Pass llm= to Agent().")
-        if not self.tools:
-            raise ValueError("No tools added. Call agent.add_tools(tool) first.")
 
         self.current_query = query
 
@@ -268,8 +281,6 @@ class Agent(AgentLoopMixin, BaseAgent):
         """
         if not self.llm:
             raise ValueError("No LLM provided. Pass llm= to Agent().")
-        if not self.tools:
-            raise ValueError("No tools added. Call agent.add_tools(tool) first.")
 
         self.current_query = query
 

@@ -599,9 +599,23 @@ class AgentLoopMixin:
 
         try:
             if isinstance(tool_input, dict):
-                result = str(func(**tool_input))
+                raw_result = func(**tool_input)
             else:
-                result = str(func(tool_input))
+                raw_result = func(tool_input)
+
+            # _execute_tool runs on a worker thread (submitted to a
+            # ThreadPoolExecutor by _run_loop/_run_loop_native), so it has no
+            # running event loop of its own -- an `async def` tool's call
+            # returns an unawaited coroutine here rather than raising, and
+            # without this check that coroutine's repr() silently became the
+            # tool's "result" (str(coroutine) succeeds), so the tool never
+            # actually ran and nothing indicated the failure. asyncio.run()
+            # is safe here specifically because this thread has no event
+            # loop of its own to conflict with.
+            if inspect.isawaitable(raw_result):
+                raw_result = asyncio.run(raw_result)
+
+            result = str(raw_result)
         except Exception as exc:
             cb: CallbackManager = getattr(self, "callback_manager", None)
             if cb:
@@ -1081,15 +1095,87 @@ class AgentLoopMixin:
     # date (human-readable trace only, not fed back to the LLM) so middleware
     # relying on the scratchpad contract still sees something sensible.
 
-    def _build_native_messages(self, query: str, memory_context: str = "") -> List[Dict[str, Any]]:
-        system_prompt: str = getattr(self, "system_prompt", "")
+    def _build_native_messages(self, query: str) -> List[Dict[str, Any]]:
+        """The conversation-turn part of the native-mode message list --
+        deliberately excludes the system prompt, which is no longer baked
+        in here. See _native_system_messages()."""
+        return [{"role": "user", "content": query}]
+
+    def _native_system_messages(self, memory_context: str = "") -> List[Dict[str, Any]]:
+        """Build the system-role prefix fresh from the *current*
+        self.system_prompt on every call, instead of _build_native_messages'
+        old approach of baking it into the message list once before the
+        loop started. Native mode's `messages` list is otherwise never
+        touched by anything that only knows how to write to
+        agent.system_prompt (autourgos-hcix's human-override injection,
+        autourgos-toolbox's "tools were just unlocked" notice) -- those
+        middleware packages mutate agent.system_prompt expecting the agent
+        to pick it up on the very next LLM call, which is true in prompt
+        mode (the prompt is re-rendered from self.system_prompt every
+        iteration) but was never true in native mode until this. Called
+        fresh every iteration and prepended to the conversation turns
+        rather than merged into them, so mid-run edits reach the model
+        starting the next iteration, matching prompt mode's behavior.
+        """
+        system_prompt: str = getattr(self, "system_prompt", "") or ""
         messages: List[Dict[str, Any]] = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         if memory_context:
             messages.append({"role": "system", "content": memory_context})
-        messages.append({"role": "user", "content": query})
         return messages
+
+    def _group_native_turns(self, messages: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+        """Group messages[1:] (everything after the original user query)
+        into turns: an assistant/user message plus any tool-result messages
+        immediately following it. Trimming must drop whole turns, never a
+        lone message out of the middle of one -- dropping only the
+        assistant message that made a tool call while leaving its "tool"
+        role results behind would orphan a tool_call_id the API doesn't
+        recognize and most providers reject the request outright.
+        """
+        turns: List[List[Dict[str, Any]]] = []
+        i = 1
+        while i < len(messages):
+            turn = [messages[i]]
+            i += 1
+            while i < len(messages) and messages[i].get("role") == "tool":
+                turn.append(messages[i])
+                i += 1
+            turns.append(turn)
+        return turns
+
+    def _trim_native_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Keep the native-mode conversation list within the same budget
+        _trim_scratchpad enforces for prompt mode (MAX_SCRATCHPAD_CHARS,
+        plus max_scratchpad_tokens if set) -- native mode's `messages` list
+        otherwise grows unboundedly across iterations (nothing was ever
+        capping it) until it blows the model's context window. Drops
+        whole turns (see _group_native_turns) from the oldest end,
+        always keeping the original user query (messages[0]) and at least
+        one turn so the conversation never goes fully empty.
+        """
+        if len(messages) <= 1:
+            return messages
+
+        max_chars: int = getattr(self, "MAX_SCRATCHPAD_CHARS", 15000)
+        max_tokens: Optional[int] = getattr(self, "max_scratchpad_tokens", None)
+        counter: Callable[[str], int] = getattr(self, "token_counter", None) or _default_token_counter
+
+        head = messages[:1]
+        turns = self._group_native_turns(messages)
+
+        def _flatten() -> List[Dict[str, Any]]:
+            return head + [m for turn in turns for m in turn]
+
+        while len(turns) > 1 and len(json.dumps(_flatten(), default=str)) > max_chars:
+            turns.pop(0)
+
+        if max_tokens is not None:
+            while len(turns) > 1 and counter(json.dumps(_flatten(), default=str)) > max_tokens:
+                turns.pop(0)
+
+        return _flatten()
 
     def _wrap_unsupported_native_error(self, exc: NotImplementedError) -> RuntimeError:
         llm_class = type(getattr(self, "llm", None)).__name__
@@ -1208,7 +1294,8 @@ class AgentLoopMixin:
         tool_timeout: Optional[float] = getattr(self, "tool_timeout", None)
         logger = getattr(self, "logger", None)
         cb: CallbackManager = getattr(self, "callback_manager", CallbackManager())
-        messages = self._build_native_messages(query, _get_memory_context(getattr(self, "memory", None), query))
+        memory_context = _get_memory_context(getattr(self, "memory", None), query)
+        messages = self._build_native_messages(query)
 
         for iteration in range(1, max_iterations + 1):
             cb.fire_iteration_start(iteration, agent=self)
@@ -1225,10 +1312,13 @@ class AgentLoopMixin:
             # with "not found" the moment it tried to call it.
             tool_map: Dict[str, Any] = {_tool_name(t): t for t in getattr(self, "tools", [])}
 
+            messages = self._trim_native_messages(messages)
+            call_messages = self._native_system_messages(memory_context) + messages
+
             call_kwargs = {**extra_kwargs, **iteration_extra_kwargs}
             try:
                 response = self._call_llm_with_retry(
-                    lambda: self.llm.invoke_with_tools(messages, self.tools, **call_kwargs)  # type: ignore[attr-defined]
+                    lambda: self.llm.invoke_with_tools(call_messages, self.tools, **call_kwargs)  # type: ignore[attr-defined]
                 )
             except NotImplementedError as exc:
                 raise self._wrap_unsupported_native_error(exc) from exc
@@ -1309,7 +1399,8 @@ class AgentLoopMixin:
         tool_timeout: Optional[float] = getattr(self, "tool_timeout", None)
         logger = getattr(self, "logger", None)
         cb: CallbackManager = getattr(self, "callback_manager", CallbackManager())
-        messages = self._build_native_messages(query, _get_memory_context(getattr(self, "memory", None), query))
+        memory_context = _get_memory_context(getattr(self, "memory", None), query)
+        messages = self._build_native_messages(query)
 
         for iteration in range(1, max_iterations + 1):
             cb.fire_iteration_start(iteration, agent=self)
@@ -1321,10 +1412,13 @@ class AgentLoopMixin:
             # Rebuilt every iteration -- see _run_loop_native's identical comment.
             tool_map: Dict[str, Any] = {_tool_name(t): t for t in getattr(self, "tools", [])}
 
+            messages = self._trim_native_messages(messages)
+            call_messages = self._native_system_messages(memory_context) + messages
+
             call_kwargs = {**extra_kwargs, **iteration_extra_kwargs}
             try:
                 response = await self._acall_llm_with_retry(
-                    lambda: self.llm.ainvoke_with_tools(messages, self.tools, **call_kwargs)  # type: ignore[attr-defined]
+                    lambda: self.llm.ainvoke_with_tools(call_messages, self.tools, **call_kwargs)  # type: ignore[attr-defined]
                 )
             except NotImplementedError as exc:
                 raise self._wrap_unsupported_native_error(exc) from exc

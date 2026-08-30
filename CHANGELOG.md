@@ -1,5 +1,32 @@
 # Changelog
 
+## 2.4.0
+
+- Fixed `async def` tools silently not running under `invoke()` (sync) --
+  `_execute_tool()` never awaited a coroutine result, so an async tool's
+  observation was the unawaited coroutine's `repr()` instead of its actual
+  return value, with no error raised. `_execute_tool_async()` (used by
+  `ainvoke()`) already handled this correctly; `_execute_tool()` now does too.
+- Fixed `tool_calling_mode="native"` never re-reading `agent.system_prompt`
+  after the loop started, so mid-run edits to it (e.g. `autourgos-hcix`'s
+  human-override injection, `autourgos-toolbox`'s tool-unlock notice) were
+  silently invisible to the model in native mode, even though the same
+  mutation works as expected in the default `"prompt"` mode. The system
+  message is now rebuilt from the live `agent.system_prompt` every iteration.
+- Fixed `tool_calling_mode="native"` having no context-window budget at all
+  -- the `messages` list grew unboundedly across iterations with nothing
+  trimming it, unlike prompt mode's `MAX_SCRATCHPAD_CHARS`-bounded
+  scratchpad. It's now trimmed to the same budget (plus
+  `max_scratchpad_tokens` if set), dropping whole oldest turns so a
+  `tool_call`/`tool` pairing is never split.
+- `invoke()`/`ainvoke()` no longer require at least one tool -- a
+  `ValueError("No tools added")` previously made tool-less turns (planning,
+  clarification, plain conversation) impossible.
+- Added `max_scratchpad_chars=`, `max_tool_output_chars=`, and
+  `max_tool_workers=` constructor parameters on `Agent`, overriding the
+  `MAX_SCRATCHPAD_CHARS` / `MAX_TOOL_OUTPUT_CHARS` / `MAX_TOOL_WORKERS`
+  class defaults per-instance instead of requiring a subclass.
+
 ## 2.3.0
 
 - Added `llm_retries`, `llm_retry_backoff`, `llm_retry_max_backoff`, and

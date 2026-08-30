@@ -241,6 +241,16 @@ def _tool_func(tool: Any) -> Optional[Callable[..., Any]]:
     return getattr(tool, "func", None) or getattr(tool, "function", None)
 
 
+def _default_should_retry(exc: BaseException) -> bool:
+    """Default llm_retry_on predicate: retry everything except
+    NotImplementedError, which signals a config error (the LLM doesn't
+    support invoke_with_tools()/ainvoke_with_tools() at all) rather than a
+    transient failure -- retrying it would just delay the clearer
+    RuntimeError _wrap_unsupported_native_error raises for it.
+    """
+    return not isinstance(exc, NotImplementedError)
+
+
 def _default_token_counter(text: str) -> int:
     """Rough token-count approximation (~4 chars/token, the common rule of
     thumb for English text) used when max_scratchpad_tokens is set but no
@@ -591,6 +601,67 @@ class AgentLoopMixin:
 
         return result
 
+    def _call_llm_with_retry(self, fn: Callable[[], Any]) -> Any:
+        """Call a zero-arg LLM invocation (``lambda: self.llm.invoke(...)``),
+        retrying on failure per llm_retries/llm_retry_backoff/llm_retry_on.
+
+        A transient failure (rate limit, network blip) used to surface
+        straight to AgentLLMError and end the run on the very first bad
+        response, even though the same call would likely succeed a moment
+        later. Retries with exponential backoff (base * 2**attempt, capped
+        at llm_retry_max_backoff) give it that moment. llm_retries=0 (the
+        default) makes this a single unconditional call, identical to prior
+        behavior.
+        """
+        retries: int = getattr(self, "llm_retries", 0) or 0
+        backoff: float = getattr(self, "llm_retry_backoff", 1.0)
+        max_backoff: float = getattr(self, "llm_retry_max_backoff", 30.0)
+        should_retry: Callable[[BaseException], bool] = getattr(self, "llm_retry_on", None) or _default_should_retry
+        logger = getattr(self, "logger", None)
+
+        attempt = 0
+        while True:
+            try:
+                return fn()
+            except Exception as exc:
+                if attempt >= retries or not should_retry(exc):
+                    raise
+                delay = min(backoff * (2 ** attempt), max_backoff)
+                if logger:
+                    logger.info(
+                        f"LLM call failed ({exc}); retrying in {delay:.1f}s "
+                        f"(attempt {attempt + 1}/{retries})."
+                    )
+                time.sleep(delay)
+                attempt += 1
+
+    async def _acall_llm_with_retry(self, coro_fn: Callable[[], Any]) -> Any:
+        """Async twin of _call_llm_with_retry -- ``coro_fn`` is a zero-arg
+        callable returning an awaitable (``lambda: self.llm.ainvoke(...)``),
+        awaited fresh on each attempt since a coroutine object can't be
+        awaited twice."""
+        retries: int = getattr(self, "llm_retries", 0) or 0
+        backoff: float = getattr(self, "llm_retry_backoff", 1.0)
+        max_backoff: float = getattr(self, "llm_retry_max_backoff", 30.0)
+        should_retry: Callable[[BaseException], bool] = getattr(self, "llm_retry_on", None) or _default_should_retry
+        logger = getattr(self, "logger", None)
+
+        attempt = 0
+        while True:
+            try:
+                return await coro_fn()
+            except Exception as exc:
+                if attempt >= retries or not should_retry(exc):
+                    raise
+                delay = min(backoff * (2 ** attempt), max_backoff)
+                if logger:
+                    logger.info(
+                        f"LLM call failed ({exc}); retrying in {delay:.1f}s "
+                        f"(attempt {attempt + 1}/{retries})."
+                    )
+                await asyncio.sleep(delay)
+                attempt += 1
+
     def _collect_future_result(self, tool_name: str, future: Any, timeout: Optional[float]) -> str:
         """Block on a submitted tool future, enforcing ``tool_timeout``.
 
@@ -695,7 +766,7 @@ class AgentLoopMixin:
             # call LLM
             call_kwargs = {**extra_kwargs, **iteration_extra_kwargs}
             try:
-                raw = self.llm.invoke(messages, **call_kwargs)  # type: ignore[attr-defined]
+                raw = self._call_llm_with_retry(lambda: self.llm.invoke(messages, **call_kwargs))  # type: ignore[attr-defined]
                 response_text = self._extract_text(raw)
             except Exception as exc:
                 raise AgentLLMError(exc) from exc
@@ -848,7 +919,7 @@ class AgentLoopMixin:
 
             call_kwargs = {**extra_kwargs, **iteration_extra_kwargs}
             try:
-                raw = await self.llm.ainvoke(messages, **call_kwargs)  # type: ignore[attr-defined]
+                raw = await self._acall_llm_with_retry(lambda: self.llm.ainvoke(messages, **call_kwargs))  # type: ignore[attr-defined]
                 response_text = self._extract_text(raw)
             except Exception as exc:
                 raise AgentLLMError(exc) from exc
@@ -1083,7 +1154,9 @@ class AgentLoopMixin:
 
             call_kwargs = {**extra_kwargs, **iteration_extra_kwargs}
             try:
-                response = self.llm.invoke_with_tools(messages, self.tools, **call_kwargs)  # type: ignore[attr-defined]
+                response = self._call_llm_with_retry(
+                    lambda: self.llm.invoke_with_tools(messages, self.tools, **call_kwargs)  # type: ignore[attr-defined]
+                )
             except NotImplementedError as exc:
                 raise self._wrap_unsupported_native_error(exc) from exc
             except Exception as exc:
@@ -1175,7 +1248,9 @@ class AgentLoopMixin:
 
             call_kwargs = {**extra_kwargs, **iteration_extra_kwargs}
             try:
-                response = await self.llm.ainvoke_with_tools(messages, self.tools, **call_kwargs)  # type: ignore[attr-defined]
+                response = await self._acall_llm_with_retry(
+                    lambda: self.llm.ainvoke_with_tools(messages, self.tools, **call_kwargs)  # type: ignore[attr-defined]
+                )
             except NotImplementedError as exc:
                 raise self._wrap_unsupported_native_error(exc) from exc
             except Exception as exc:

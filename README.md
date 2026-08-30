@@ -63,6 +63,7 @@ This continues until the agent has a final answer or hits the iteration/time lim
 - [Context Manager](#context-manager)
 - [Time and Iteration Limits](#time-and-iteration-limits)
 - [Scratchpad Size Limits](#scratchpad-size-limits)
+- [LLM Call Retries](#llm-call-retries)
 - [Custom System Prompt](#custom-system-prompt)
 - [Constructor Reference](#constructor-reference)
 - [Tool Dict Reference](#tool-dict-reference)
@@ -923,6 +924,44 @@ only the character cap applies, matching prior behavior.
 
 ---
 
+## LLM Call Retries
+
+By default, any failed LLM call (rate limit, network blip, transient 5xx)
+raises `AgentLLMError` immediately and ends the run — the same call would
+often succeed a moment later. `llm_retries` retries with exponential
+backoff instead:
+
+```python
+agent = Agent(
+    llm=OpenAIChatModel(model="gpt-4o"),
+    llm_retries=3,             # retry up to 3 times before giving up
+    llm_retry_backoff=1.0,     # base delay: 1s, 2s, 4s (capped below)
+    llm_retry_max_backoff=30.0,
+)
+agent.add_tools(search_tool)
+
+result = agent.invoke("What's the latest news?")
+# A rate-limited call now retries instead of failing the whole run outright.
+```
+
+By default every exception is retried **except** `NotImplementedError`
+(the signal that `tool_calling_mode="native"` isn't supported by this LLM at
+all — a config error, not a transient one, so retrying it would just delay
+the clearer error). Pass `llm_retry_on` to customize which errors are worth
+retrying:
+
+```python
+def only_rate_limits(exc: Exception) -> bool:
+    return "rate limit" in str(exc).lower()
+
+agent = Agent(llm=llm, llm_retries=5, llm_retry_on=only_rate_limits)
+```
+
+`llm_retries=0` (the default) disables this and matches prior behavior — a
+single unconditional call, raising `AgentLLMError` on the first failure.
+
+---
+
 ## Custom System Prompt
 
 Add extra instructions that persist across all steps.
@@ -955,6 +994,10 @@ result = agent.invoke("What is the P/E ratio of Apple?")
 | `tool_timeout` | `float` | `None` | Per-tool-call timeout in seconds. See [Time and Iteration Limits](#time-and-iteration-limits) |
 | `max_scratchpad_tokens` | `int` | `None` | Extra token-based scratchpad budget on top of `MAX_SCRATCHPAD_CHARS`. See [Scratchpad Size Limits](#scratchpad-size-limits) |
 | `token_counter` | `callable` | `None` | `fn(text) -> int` used to count tokens for `max_scratchpad_tokens`. Defaults to a `len(text) // 4` approximation |
+| `llm_retries` | `int` | `0` | Retries on a failed LLM call before raising `AgentLLMError`. See [LLM Call Retries](#llm-call-retries) |
+| `llm_retry_backoff` | `float` | `1.0` | Base delay in seconds between retries (exponential: `backoff * 2**attempt`) |
+| `llm_retry_max_backoff` | `float` | `30.0` | Upper bound in seconds on the exponential backoff delay |
+| `llm_retry_on` | `callable` | `None` | `fn(exc) -> bool` deciding whether a failure is worth retrying. Defaults to retrying everything except `NotImplementedError` |
 | `approval_callback` | `callable` | `None` | Called as `fn(tool_name, tool_input)` before each tool. Return truthy to allow |
 | `middleware` | `list[CallbackHandler]` | `None` | Event hooks for lifecycle events |
 | `max_consecutive_parse_errors` | `int` | `3` | Stop after this many back-to-back JSON parse failures |

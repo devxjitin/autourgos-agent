@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.3.0
+
+- Added `llm_retries`, `llm_retry_backoff`, `llm_retry_max_backoff`, and
+  `llm_retry_on` (defaults `0`, `1.0`, `30.0`, `None`): automatic retry with
+  exponential backoff on a failed LLM call, in place of raising
+  `AgentLLMError` on the very first transient failure (rate limit, network
+  blip, transient 5xx). Applies to `invoke()`/`ainvoke()` and both
+  `tool_calling_mode` values. Defaults to retrying every exception except
+  `NotImplementedError` (a config error signaling `tool_calling_mode="native"`
+  isn't supported by the given LLM at all, not a transient one) — override
+  with `llm_retry_on=fn(exc) -> bool` for finer control (e.g. only retry
+  rate-limit errors). `llm_retries=0` (the default) makes this a single
+  unconditional call, identical to prior behavior.
+
 ## 2.2.0
 
 - Added `max_scratchpad_tokens` and `token_counter` (both default `None`): a

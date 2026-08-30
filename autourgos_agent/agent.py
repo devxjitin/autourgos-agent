@@ -74,6 +74,21 @@ class Agent(AgentLoopMixin, BaseAgent):
         tokenizer for accuracy, e.g.
         `token_counter=lambda t: len(tiktoken.encoding_for_model(model).encode(t))`.
         Ignored if max_scratchpad_tokens is None.
+    llm_retries : int
+        Number of retries on a failed LLM call (rate limit, network blip,
+        etc.) before giving up and raising AgentLLMError. 0 (default) means
+        a single unconditional call, matching prior behavior -- no retries.
+    llm_retry_backoff : float
+        Base delay in seconds between retries. Backs off exponentially
+        (backoff * 2**attempt), capped at llm_retry_max_backoff. Ignored if
+        llm_retries is 0.
+    llm_retry_max_backoff : float
+        Upper bound in seconds on the exponential backoff delay.
+    llm_retry_on : callable, optional
+        `fn(exc: Exception) -> bool` deciding whether a given failure is
+        worth retrying. Defaults to retrying everything except
+        NotImplementedError (which signals tool_calling_mode="native" isn't
+        supported by this LLM at all -- a config error, not transient).
     approval_callback : callable, optional
         Called before each tool execution as approval_callback(tool_name, tool_input).
         Return a truthy value to allow, falsy to deny.
@@ -117,6 +132,10 @@ class Agent(AgentLoopMixin, BaseAgent):
         tool_timeout: Optional[float] = None,
         max_scratchpad_tokens: Optional[int] = None,
         token_counter: Optional[Callable[[str], int]] = None,
+        llm_retries: int = 0,
+        llm_retry_backoff: float = 1.0,
+        llm_retry_max_backoff: float = 30.0,
+        llm_retry_on: Optional[Callable[[BaseException], bool]] = None,
         approval_callback: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
         middleware: Optional[List[CallbackHandler]] = None,
         max_consecutive_parse_errors: int = 3,
@@ -142,6 +161,10 @@ class Agent(AgentLoopMixin, BaseAgent):
         self.tool_timeout = tool_timeout
         self.max_scratchpad_tokens = max_scratchpad_tokens
         self.token_counter = token_counter
+        self.llm_retries = llm_retries
+        self.llm_retry_backoff = llm_retry_backoff
+        self.llm_retry_max_backoff = llm_retry_max_backoff
+        self.llm_retry_on = llm_retry_on
         self.approval_callback = approval_callback
         self.max_consecutive_parse_errors = max_consecutive_parse_errors
         self.system_prompt   = system_prompt

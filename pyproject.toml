@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autourgos-agent"
-version = "2.7.1"
+version = "2.7.2"
 description = "Self-contained, general-purpose LLM agent for the Autourgos framework — works with any OpenAI-compatible LLM"
 readme = "README.md"
-license = "MIT"
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
 authors = [
     { name = "Jitin Kumar Sengar", email = "devxjitin@gmail.com" },
@@ -20,6 +20,7 @@ keywords = [
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",

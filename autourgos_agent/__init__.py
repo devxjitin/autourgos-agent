@@ -91,7 +91,7 @@ try:
     from importlib.metadata import version as _meta_version, PackageNotFoundError as _PNF
     __version__ = _meta_version("autourgos-agent")
 except Exception:
-    __version__ = "2.7.0"
+    __version__ = "2.7.2"
 
 __all__ = [
     "Agent",

@@ -134,18 +134,7 @@ def test_tool_with_explicit_parameters_schema():
     assert search["parameters"] is custom_schema
 
 
-def test_tool_policy_metadata_is_opt_in_and_preserved():
-    def describe(call):
-        return call
-
-    @tool(describe=describe, capability="files", risk="write")
-    def save(text: str) -> str:
-        return text
-
-    assert save["describe"] is describe
-    assert save["capability"] == "files"
-    assert save["risk"] == "write"
-
+def test_tool_dict_shape_is_exactly_four_keys():
     @tool
     def legacy(text: str) -> str:
         return text

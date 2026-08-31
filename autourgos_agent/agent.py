@@ -120,25 +120,6 @@ class Agent(AgentLoopMixin, BaseAgent):
         Per-instance override of MAX_TOOL_OUTPUT_CHARS (class default 5,000).
     max_tool_workers : int, optional
         Per-instance override of MAX_TOOL_WORKERS (class default 8).
-    backend : "legacy" | "kernel"
-        "legacy" (default): the original loop implementation in this
-        file/base.py -- unaffected by this parameter, works with zero
-        extra dependencies.
-        "kernel": delegates invoke()/ainvoke() to autourgos-kernel's
-        Engine/Run instead (requires `pip install autourgos-agent[kernel]`),
-        giving you Run-based state isolation and checkpoint/resume. Opt-in
-        and has a few documented behavioral gaps vs "legacy" -- see
-        autourgos_agent/kernel_backend.py's module docstring before
-        relying on it for anything beyond straightforward tool-calling
-        agents (no mid-run tool exposure, no llm_retries, no on_iteration/
-        on_before_iteration hooks).
-    capabilities : list, optional
-        Typed Capability objects exposed to the kernel. Kernel backend only.
-    policy_executor_factory : callable, optional
-        Called once per invocation as `factory(run)` and must return a policy
-        executor. Kernel backend only.
-    max_effects : int, optional
-        Maximum policy-approved effects for one run. Kernel backend only.
     """
 
     MAX_CONSECUTIVE_PARSE_ERRORS: int = 3
@@ -170,52 +151,12 @@ class Agent(AgentLoopMixin, BaseAgent):
         max_scratchpad_chars: Optional[int] = None,
         max_tool_output_chars: Optional[int] = None,
         max_tool_workers: Optional[int] = None,
-        backend: str = "legacy",
-        capabilities: Optional[List[Any]] = None,
-        policy_executor_factory: Optional[Callable[[Any], Any]] = None,
-        max_effects: Optional[int] = None,
     ) -> None:
         if tool_calling_mode not in ("prompt", "native"):
             raise ValueError(
                 f"tool_calling_mode must be 'prompt' or 'native', got {tool_calling_mode!r}."
             )
-        if backend not in ("legacy", "kernel"):
-            raise ValueError(f"backend must be 'legacy' or 'kernel', got {backend!r}.")
-        if max_effects is not None and (
-            not isinstance(max_effects, int) or isinstance(max_effects, bool) or max_effects < 0
-        ):
-            raise ValueError("max_effects must be a non-negative integer or None.")
-        if policy_executor_factory is not None and not callable(policy_executor_factory):
-            raise ValueError("policy_executor_factory must be callable or None.")
-        if backend != "kernel" and (
-            capabilities is not None
-            or policy_executor_factory is not None
-            or max_effects is not None
-        ):
-            raise ValueError(
-                "capabilities, policy_executor_factory, and max_effects require backend='kernel'."
-            )
-        if capabilities and policy_executor_factory is None:
-            # Fail closed, at construction time: capabilities declare risk
-            # precisely so a policy layer can gate them. Without a
-            # policy_executor_factory, autourgos_kernel.Engine would either
-            # raise this same error lazily on invoke() (confusing -- the
-            # agent looked configured, then failed on first use) or, before
-            # that check existed, silently run every capability tool
-            # completely unguarded. Neither is acceptable for something
-            # whose whole purpose is safety gating.
-            raise ValueError(
-                "capabilities were provided but policy_executor_factory was not. "
-                "Capability tools declare risk so a policy layer can gate them -- "
-                "running them without one would execute every capability tool "
-                "call completely unguarded. Pass policy_executor_factory=, or "
-                "drop capabilities= if you only need legacy tools."
-            )
         self.tool_calling_mode = tool_calling_mode
-        self.backend = backend
-        self.capabilities = list(capabilities or [])
-        self.policy_executor_factory = policy_executor_factory
-        self.max_effects = max_effects
         super().__init__(
             llm=llm,
             memory=memory,
@@ -308,12 +249,6 @@ class Agent(AgentLoopMixin, BaseAgent):
             self.callback_manager.fire_agent_start(query, agent=self)
             self.logger.run_start(query)
 
-            if self.backend == "kernel":
-                from .kernel_backend import invoke_kernel
-                return invoke_kernel(
-                    self, query, max_iterations or self.max_iterations, kwargs
-                )
-
             if self.tool_calling_mode == "native":
                 return self._run_loop_native(
                     query,
@@ -356,12 +291,6 @@ class Agent(AgentLoopMixin, BaseAgent):
 
             self.callback_manager.fire_agent_start(query, agent=self)
             self.logger.run_start(query)
-
-            if self.backend == "kernel":
-                from .kernel_backend import ainvoke_kernel
-                return await ainvoke_kernel(
-                    self, query, max_iterations or self.max_iterations, kwargs
-                )
 
             if self.tool_calling_mode == "native":
                 return await self._arun_loop_native(

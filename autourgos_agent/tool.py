@@ -219,9 +219,6 @@ class Tool(dict):
         name: Optional[str] = None,
         description: Optional[str] = None,
         parameters: Optional[Dict[str, Any]] = None,
-        describe: Optional[Callable[..., Any]] = None,
-        capability: Optional[str] = None,
-        risk: Optional[str] = None,
     ) -> None:
         self.func = func
         resolved_name = name or getattr(func, "__name__", "tool")
@@ -234,12 +231,6 @@ class Tool(dict):
             parameters=resolved_parameters,
             func=func,
         )
-        if describe is not None:
-            self["describe"] = describe
-        if capability is not None:
-            self["capability"] = capability
-        if risk is not None:
-            self["risk"] = risk
 
         try:
             functools.update_wrapper(self, func, updated=())
@@ -259,9 +250,6 @@ def tool(
     name: Optional[str] = None,
     description: Optional[str] = None,
     parameters: Optional[Dict[str, Any]] = None,
-    describe: Optional[Callable[..., Any]] = None,
-    capability: Optional[str] = None,
-    risk: Optional[str] = None,
 ) -> Any:
     '''
     Turn a plain, type-hinted function into an Autourgos tool spec.
@@ -289,9 +277,6 @@ def tool(
             name=name,
             description=description,
             parameters=parameters,
-            describe=describe,
-            capability=capability,
-            risk=risk,
         )
 
     if func is not None and callable(func):

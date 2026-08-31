@@ -200,8 +200,6 @@ agent.add_tools(get_weather)
   inference can't express.
 - The decorated function stays directly callable — `get_weather("Tokyo")` still
   works outside the agent, e.g. in your own tests.
-- Policy-aware kernel tools may also provide `describe=`, `capability=`, and
-  `risk=` metadata. These keys are omitted unless explicitly supplied.
 
 ```python
 # Overriding the inferred name/description:
@@ -964,46 +962,6 @@ single unconditional call, raising `AgentLLMError` on the first failure.
 
 ---
 
-## Policy-aware kernel runs
-
-Install the optional policy stack and opt into the kernel backend:
-
-```bash
-pip install "autourgos-agent[policy]"
-```
-
-```python
-from autourgos_agent import Agent, tool
-from autourgos_core import Action, Risk
-from autourgos_policy import PolicyConfig, PolicyExecutor, PolicyGate
-
-def describe_save(call):
-    return Action(tool=call.name, arguments=call.arguments, risk=Risk.WRITE)
-
-@tool(describe=describe_save, capability="notes", risk="write")
-def save_note(text: str) -> str:
-    return "saved"
-
-def policy_for_run(run):
-    gate = PolicyGate(PolicyConfig(profile="assisted", require_targets=False))
-    return PolicyExecutor(gate, confirmation_callback=lambda action, decision: True)
-
-agent = Agent(
-    llm=llm,
-    backend="kernel",
-    tools=[save_note],
-    policy_executor_factory=policy_for_run,
-    max_effects=5,
-)
-```
-
-The factory receives the new `Run`, so executor counters, journals, and dry-run
-plans stay isolated per invocation. Policy mode denies tools that have no valid
-Action describer. Omitting `policy_executor_factory` keeps the existing kernel
-execution path; the default `backend="legacy"` remains unchanged.
-
----
-
 ## Custom System Prompt
 
 Add extra instructions that persist across all steps.
@@ -1046,10 +1004,6 @@ result = agent.invoke("What is the P/E ratio of Apple?")
 | `tools` | `list[dict]` | `None` | Initial tool list (more can be added with `add_tools()`) |
 | `system_prompt` | `str` | `""` | Extra system-level instruction added to every prompt |
 | `tool_calling_mode` | `"prompt"` \| `"native"` | `"prompt"` | `"prompt"`: the original JSON-in-text agent loop. `"native"`: uses the LLM's `invoke_with_tools()`/`ainvoke_with_tools()` — structured tool calls straight from the API, no JSON parsing, and multiple tool calls in one turn run concurrently. See [Native Tool Calling](#native-tool-calling) |
-| `backend` | `"legacy"` \| `"kernel"` | `"legacy"` | Select the compatibility loop or optional kernel engine |
-| `capabilities` | `list` | `None` | Typed capabilities for `backend="kernel"` |
-| `policy_executor_factory` | `callable` | `None` | `factory(run)` returning a fresh executor for a policy-aware kernel run |
-| `max_effects` | `int` | `None` | Per-run effect ceiling enforced at the policy boundary |
 
 ---
 
@@ -1061,9 +1015,6 @@ result = agent.invoke("What is the P/E ratio of Apple?")
 | `description` | `str` | yes | Plain-English description of what the tool does and when to use it |
 | `parameters` | `dict` | recommended | JSON-Schema `object` describing the function's inputs |
 | `func` | `callable` | yes | The Python function to call. Can be sync or async |
-| `describe` | `callable` | policy mode | Converts a typed `ToolCall` into an `Action` before execution |
-| `capability` | `str` | no | Capability namespace metadata |
-| `risk` | `str` | no | Declared risk metadata shown in the normalized tool spec |
 
 `parameters` format (JSON Schema):
 

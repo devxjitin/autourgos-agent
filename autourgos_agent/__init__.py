@@ -39,39 +39,6 @@ from .logging import AgentLogger
 from .runtime import build_tool_list, parse_json_object
 from .tool    import tool, Tool
 
-# Soft re-export of autourgos-core's typed vocabulary (Message, ToolCall,
-# ToolResult, ToolSpec, RunState, etc.) -- only resolves if autourgos-core
-# is separately installed (pip install autourgos-agent[core]), mirroring
-# the autourgos-memory family's soft re-export pattern. autourgos-core is
-# deliberately NOT a required dependency: this package's zero-required-
-# dependencies design is intentional and preserved. Nothing about Agent's
-# behavior depends on autourgos-core being present.
-_core_exports: list = []
-try:
-    from autourgos_core import (
-        Action,
-        ArtifactRef,
-        Budget,
-        Decision,
-        Effect,
-        Message,
-        ModelResponse,
-        Resource,
-        Risk,
-        RunState,
-        ToolCall as CoreToolCall,
-        ToolResult as CoreToolResult,
-        ToolBinding,
-        ToolSpec as CoreToolSpec,
-    )
-    _core_exports = [
-        "Action", "ArtifactRef", "Budget", "Decision", "Effect", "Message",
-        "ModelResponse", "Resource", "Risk", "RunState",
-        "CoreToolCall", "CoreToolResult", "CoreToolSpec", "ToolBinding",
-    ]
-except ImportError:
-    pass
-
 # v1 backward-compat alias
 import warnings as _warnings
 
@@ -117,4 +84,4 @@ __all__ = [
     # tool decorator
     "tool",
     "Tool",
-] + _core_exports
+]

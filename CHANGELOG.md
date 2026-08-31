@@ -1,5 +1,25 @@
 # Changelog
 
+## 3.0.0
+
+- **Breaking:** removed the `backend="kernel"` bridge and everything it
+  depended on -- `Agent(backend=..., capabilities=..., policy_executor_factory=...,
+  max_effects=...)` constructor params, `kernel_backend.py`, and the soft
+  re-export of `autourgos-core`'s typed vocabulary from the package's
+  `__init__.py`. The v3 kernel/policy/capabilities stack this bridged to has
+  been removed from the workspace; `autourgos-agent` returns to its original
+  zero-dependency design with only `backend="legacy"` (the default and only
+  loop implementation, unchanged).
+- **Breaking:** removed `describe=`/`capability=`/`risk=` from `@tool` and
+  `Tool` -- these existed solely to feed the removed policy pipeline. Plain
+  tool dicts and `@tool`-decorated functions are unaffected otherwise.
+- Removed the `core`/`kernel`/`policy` optional-dependency extras from
+  `pyproject.toml`.
+- No change to `backend="legacy"` behavior (async tool handling, native-mode
+  system prompt rebuild, native message trimming, tool-less turns, or the
+  `max_scratchpad_chars=`/`max_tool_output_chars=`/`max_tool_workers=`
+  constructor params).
+
 ## 2.7.1
 
 - **Security fix:** `Agent(backend="kernel", capabilities=[...])` now

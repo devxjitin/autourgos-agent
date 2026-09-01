@@ -770,6 +770,28 @@ This is how middleware can, for example, inject a trace id, override a
 sampling parameter, or attach per-call metadata without the agent needing
 to know anything about the specific middleware doing it.
 
+**Hooks may be sync or async, from either `invoke()` or `ainvoke()`**
+Define a hook as a plain `def` or an `async def` — both work from both
+loops:
+
+- From `ainvoke()` (the async loop), a sync hook runs on a background
+  thread rather than the event-loop thread, so a blocking call inside it
+  (an LLM request, a file write, `time.sleep`, anything) doesn't stall the
+  loop for every other concurrent `ainvoke()` call sharing that thread. An
+  async hook is awaited directly.
+- From `invoke()` (the sync loop), a sync hook is called directly, same as
+  always; an async hook is driven to completion with its own
+  short-lived event loop.
+
+```python
+class RemoteAudit(CallbackHandler):
+    async def on_iteration_start(self, iteration, agent=None, **kwargs):
+        await audit_client.log(agent.current_query, iteration)
+```
+
+You don't need to pick one style for a whole handler — different hooks on
+the same class can mix sync and async freely.
+
 ---
 
 ## Testing

@@ -150,6 +150,69 @@ def test_prompt_loop_llm_error_raises():
         agent.invoke("go")
 
 
+# -- malformed `actions` shape --------------------------------------------------
+
+def test_prompt_loop_malformed_actions_shape_is_treated_as_parse_error():
+    """A response with `actions` as a single object (not a list of dicts) used
+    to pass the `if not actions` truthiness check, then crash with
+    AttributeError when the loop did `for action_dict in actions:
+    action_dict.get(...)` over the dict's string keys. It must instead be
+    treated the same as any other malformed response."""
+    responses = [
+        json.dumps({
+            "thought": "oops",
+            "actions": {"action": "noop", "action_input": {}},
+            "final_answer": None,
+        })
+    ] * 5
+    agent = Agent(llm=ScriptedFakeLLM(responses), max_iterations=10, max_consecutive_parse_errors=2)
+    agent.add_tools(_tool("noop", lambda: None))
+
+    with pytest.raises(AgentParseError):
+        agent.invoke("confuse me with a dict instead of a list")
+
+
+def test_prompt_loop_actions_with_non_dict_items_is_treated_as_parse_error():
+    responses = [
+        json.dumps({"thought": None, "actions": ["noop"], "final_answer": None})
+    ] * 5
+    agent = Agent(llm=ScriptedFakeLLM(responses), max_iterations=10, max_consecutive_parse_errors=2)
+    agent.add_tools(_tool("noop", lambda: None))
+
+    with pytest.raises(AgentParseError):
+        agent.invoke("confuse me with a list of strings")
+
+
+# -- explicit max_iterations=0 --------------------------------------------------
+
+def test_invoke_explicit_max_iterations_zero_is_respected():
+    """max_iterations=0 is falsy, so `max_iterations or self.max_iterations`
+    used to silently fall back to the instance default instead of honoring
+    the explicit override."""
+    responses = [
+        json.dumps({"thought": "still thinking", "actions": [], "final_answer": None})
+        for _ in range(10)
+    ]
+    agent = Agent(llm=ScriptedFakeLLM(responses), max_iterations=5)
+    agent.add_tools(_tool("noop", lambda: None))
+
+    with pytest.raises(AgentMaxIterationsError):
+        agent.invoke("never finish", max_iterations=0)
+
+
+@pytest.mark.asyncio
+async def test_ainvoke_explicit_max_iterations_zero_is_respected():
+    responses = [
+        json.dumps({"thought": "still thinking", "actions": [], "final_answer": None})
+        for _ in range(10)
+    ]
+    agent = Agent(llm=ScriptedFakeLLM(responses), max_iterations=5)
+    agent.add_tools(_tool("noop", lambda: None))
+
+    with pytest.raises(AgentMaxIterationsError):
+        await agent.ainvoke("never finish", max_iterations=0)
+
+
 @pytest.mark.asyncio
 async def test_async_prompt_loop_llm_error_raises():
     class RaisingLLM:

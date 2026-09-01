@@ -213,6 +213,14 @@ class Agent(AgentLoopMixin, BaseAgent):
             thought = None
         if not actions or actions in ("None", "null", ""):
             actions = []
+        # `actions` must be a list of {action, action_input} dicts. A model
+        # that replies with a single object instead of a one-item list (or
+        # any other malformed shape) must be treated the same as any other
+        # malformed response -- fed back through the parse-error retry path
+        # -- rather than crashing the loop when base.py iterates it expecting
+        # dicts (e.g. `for action_dict in actions: action_dict.get(...)`).
+        elif not (isinstance(actions, list) and all(isinstance(a, dict) for a in actions)):
+            actions = []
         if final_answer in (None, "None", "null", ""):
             final_answer = None
 
@@ -240,6 +248,9 @@ class Agent(AgentLoopMixin, BaseAgent):
             raise ValueError("No LLM provided. Pass llm= to Agent().")
 
         self.current_query = query
+        resolved_max_iterations = (
+            self.max_iterations if max_iterations is None else max_iterations
+        )
 
         try:
             if self.memory:
@@ -252,13 +263,13 @@ class Agent(AgentLoopMixin, BaseAgent):
             if self.tool_calling_mode == "native":
                 return self._run_loop_native(
                     query,
-                    max_iterations=max_iterations or self.max_iterations,
+                    max_iterations=resolved_max_iterations,
                     approval_callback=self.approval_callback,
                     extra_kwargs=kwargs,
                 )
             return self._run_loop(
                 query,
-                max_iterations=max_iterations or self.max_iterations,
+                max_iterations=resolved_max_iterations,
                 approval_callback=self.approval_callback,
                 extra_kwargs=kwargs,
             )
@@ -283,30 +294,33 @@ class Agent(AgentLoopMixin, BaseAgent):
             raise ValueError("No LLM provided. Pass llm= to Agent().")
 
         self.current_query = query
+        resolved_max_iterations = (
+            self.max_iterations if max_iterations is None else max_iterations
+        )
 
         try:
             if self.memory:
                 self.memory.add_user_message(query)
                 self.logger.memory_action("Added user message to memory.")
 
-            self.callback_manager.fire_agent_start(query, agent=self)
+            await self.callback_manager.afire_agent_start(query, agent=self)
             self.logger.run_start(query)
 
             if self.tool_calling_mode == "native":
                 return await self._arun_loop_native(
                     query,
-                    max_iterations=max_iterations or self.max_iterations,
+                    max_iterations=resolved_max_iterations,
                     approval_callback=self.approval_callback,
                     extra_kwargs=kwargs,
                 )
             return await self._arun_loop(
                 query,
-                max_iterations=max_iterations or self.max_iterations,
+                max_iterations=resolved_max_iterations,
                 approval_callback=self.approval_callback,
                 extra_kwargs=kwargs,
             )
         except Exception as exc:
-            self.callback_manager.fire_agent_error(exc, agent=self)
+            await self.callback_manager.afire_agent_error(exc, agent=self)
             raise
         finally:
             self.logger.run_end()

@@ -365,13 +365,49 @@ def _get_memory_context(memory: Any, query: str) -> str:
 # ── CallbackManager ────────────────────────────────────────────────────────────
 
 class CallbackManager:
-    """Fires lifecycle events to all registered handlers."""
+    """Fires lifecycle events to all registered handlers.
+
+    Hook methods (``on_iteration_start``, ``on_tool_start``, etc.) may be
+    defined as either a plain ``def`` or an ``async def`` on a
+    ``CallbackHandler`` subclass -- both are supported from both the sync
+    loop (``invoke()``) and the async loop (``ainvoke()``):
+
+    - From the async loop, a sync hook is run in a background thread (via
+      ``loop.run_in_executor``) so a blocking call inside it (an LLM
+      request, a file write, anything) does not stall the event loop for
+      the whole run; an async hook is awaited directly.
+    - From the sync loop, an async hook is driven to completion with
+      ``asyncio.run()`` (there's no event loop already running to await
+      into); a sync hook is just called directly, as before.
+
+    This mirrors ``_maybe_await``'s existing support for an async
+    ``approval_callback``, applied to the rest of the middleware surface.
+    """
 
     def __init__(self, handlers: Optional[List[CallbackHandler]] = None) -> None:
         self._handlers: List[CallbackHandler] = list(handlers or [])
+        self._hook_executor: Optional[ThreadPoolExecutor] = None
 
     def add_handler(self, handler: CallbackHandler) -> None:
         self._handlers.append(handler)
+
+    def _get_hook_executor(self) -> ThreadPoolExecutor:
+        if self._hook_executor is None:
+            self._hook_executor = ThreadPoolExecutor(
+                max_workers=4, thread_name_prefix="autourgos_agent_hooks"
+            )
+        return self._hook_executor
+
+    def _call_with_agent_fallback(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Call ``fn(*args, **kwargs)``, retrying without ``agent=`` if the
+        handler's signature doesn't accept it (older/narrower handlers)."""
+        try:
+            return fn(*args, **kwargs)
+        except TypeError:
+            if "agent" in kwargs:
+                retry_kwargs = {k: v for k, v in kwargs.items() if k != "agent"}
+                return fn(*args, **retry_kwargs)
+            raise
 
     def _fire(self, method: str, *args: Any, **kwargs: Any) -> None:
         for h in self._handlers:
@@ -379,19 +415,43 @@ class CallbackManager:
             if not callable(fn):
                 continue
             try:
-                try:
-                    fn(*args, **kwargs)
-                except TypeError:
-                    # Backward compatibility: older handlers may define a
-                    # narrower signature that doesn't accept kwargs such
-                    # as `agent=`. Retry without them.
-                    if "agent" in kwargs:
-                        retry_kwargs = {k: v for k, v in kwargs.items() if k != "agent"}
-                        fn(*args, **retry_kwargs)
-                    else:
-                        raise
+                if inspect.iscoroutinefunction(fn):
+                    # No running event loop here (this is the sync-loop
+                    # path) -- asyncio.run() gives the coroutine its own
+                    # loop to run to completion in.
+                    asyncio.run(self._call_with_agent_fallback(fn, *args, **kwargs))
+                else:
+                    self._call_with_agent_fallback(fn, *args, **kwargs)
             except Exception:
-                _logger.debug(
+                _logger.warning(
+                    "Callback handler %s raised in %s",
+                    type(h).__name__,
+                    method,
+                    exc_info=True,
+                )
+
+    async def _afire(self, method: str, *args: Any, **kwargs: Any) -> None:
+        for h in self._handlers:
+            fn = getattr(h, method, None)
+            if not callable(fn):
+                continue
+            try:
+                if inspect.iscoroutinefunction(fn):
+                    await self._call_with_agent_fallback(fn, *args, **kwargs)
+                else:
+                    # Offload the (potentially blocking) sync hook to a
+                    # worker thread instead of calling it directly on the
+                    # event-loop thread, so e.g. a summarizer middleware's
+                    # blocking llm.invoke() inside on_iteration_start
+                    # doesn't stall every other concurrent ainvoke() run
+                    # sharing this thread for its whole duration.
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(
+                        self._get_hook_executor(),
+                        lambda: self._call_with_agent_fallback(fn, *args, **kwargs),
+                    )
+            except Exception:
+                _logger.warning(
                     "Callback handler %s raised in %s",
                     type(h).__name__,
                     method,
@@ -437,7 +497,7 @@ class CallbackManager:
                 except TypeError:
                     result = fn(iteration, **kw)
             except Exception:
-                _logger.debug(
+                _logger.warning(
                     "Callback handler %s raised in on_before_iteration",
                     type(h).__name__,
                     exc_info=True,
@@ -455,6 +515,77 @@ class CallbackManager:
 
     def fire_parse_error(self, iteration: int, raw_response: str, agent: Any = None, **kw: Any) -> None:
         self._fire("on_parse_error", iteration, raw_response, agent=agent, **kw)
+
+    # ── async firing (used by the async loops: _arun_loop / _arun_loop_native /
+    # _gate_tool_calls_for_approval_async / _execute_tool_async*) ──────────────
+
+    async def afire_agent_start(self, query: str, agent: Any = None, **kw: Any) -> None:
+        await self._afire("on_agent_start", query, agent=agent, **kw)
+
+    async def afire_agent_end(self, result: str, agent: Any = None, **kw: Any) -> None:
+        await self._afire("on_agent_end", result, agent=agent, **kw)
+
+    async def afire_agent_error(self, error: Exception, agent: Any = None, **kw: Any) -> None:
+        await self._afire("on_agent_error", error, agent=agent, **kw)
+
+    async def afire_tool_start(self, tool_name: str, tool_input: Dict[str, Any], agent: Any = None, **kw: Any) -> None:
+        await self._afire("on_tool_start", tool_name, tool_input, agent=agent, **kw)
+
+    async def afire_tool_end(self, tool_name: str, result: str, agent: Any = None, **kw: Any) -> None:
+        await self._afire("on_tool_end", tool_name, result, agent=agent, **kw)
+
+    async def afire_tool_error(self, tool_name: str, error: Exception, agent: Any = None, **kw: Any) -> None:
+        await self._afire("on_tool_error", tool_name, error, agent=agent, **kw)
+
+    async def afire_iteration_start(self, iteration: int, agent: Any = None, **kw: Any) -> None:
+        await self._afire("on_iteration_start", iteration, agent=agent, **kw)
+
+    async def afire_before_iteration(self, iteration: int, agent: Any = None, **kw: Any) -> Dict[str, Any]:
+        """Async twin of fire_before_iteration -- same merge semantics, but
+        a sync handler's on_before_iteration runs off-thread and an async
+        one is awaited directly, instead of always blocking the event loop."""
+        merged: Dict[str, Any] = {}
+        for h in self._handlers:
+            fn = getattr(h, "on_before_iteration", None)
+            if not callable(fn):
+                continue
+            try:
+                if inspect.iscoroutinefunction(fn):
+                    try:
+                        result = await fn(iteration, agent=agent, **kw)
+                    except TypeError:
+                        result = await fn(iteration, **kw)
+                else:
+                    loop = asyncio.get_running_loop()
+                    try:
+                        result = await loop.run_in_executor(
+                            self._get_hook_executor(),
+                            lambda: fn(iteration, agent=agent, **kw),
+                        )
+                    except TypeError:
+                        result = await loop.run_in_executor(
+                            self._get_hook_executor(),
+                            lambda: fn(iteration, **kw),
+                        )
+            except Exception:
+                _logger.warning(
+                    "Callback handler %s raised in on_before_iteration",
+                    type(h).__name__,
+                    exc_info=True,
+                )
+                continue
+            if isinstance(result, dict):
+                merged.update(result)
+        return merged
+
+    async def afire_iteration(self, iteration: int, thought: Optional[str], agent: Any = None, **kw: Any) -> None:
+        await self._afire("on_iteration", iteration, thought, agent=agent, **kw)
+
+    async def afire_llm_end(self, response: Any, agent: Any = None, **kw: Any) -> None:
+        await self._afire("on_llm_end", response, agent=agent, **kw)
+
+    async def afire_parse_error(self, iteration: int, raw_response: str, agent: Any = None, **kw: Any) -> None:
+        await self._afire("on_parse_error", iteration, raw_response, agent=agent, **kw)
 
 
 # ── BaseLLM ────────────────────────────────────────────────────────────────────
@@ -658,7 +789,7 @@ class AgentLoopMixin:
         except Exception as exc:
             cb: CallbackManager = getattr(self, "callback_manager", None)
             if cb:
-                cb.fire_tool_error(tool_name, exc, agent=self)
+                await cb.afire_tool_error(tool_name, exc, agent=self)
             result = f"Error executing '{tool_name}': {exc}"
 
         if len(result) > max_chars:
@@ -767,7 +898,7 @@ class AgentLoopMixin:
             result = f"Error: tool '{tool_name}' timed out after {timeout}s."
             cb: CallbackManager = getattr(self, "callback_manager", None)
             if cb:
-                cb.fire_tool_error(tool_name, TimeoutError(result), agent=self)
+                await cb.afire_tool_error(tool_name, TimeoutError(result), agent=self)
             return result
 
     def _trim_scratchpad(self, scratchpad: str) -> str:
@@ -976,8 +1107,8 @@ class AgentLoopMixin:
         memory_context = _get_memory_context(getattr(self, "memory", None), query)
 
         for iteration in range(1, max_iterations + 1):
-            cb.fire_iteration_start(iteration, agent=self)
-            iteration_extra_kwargs = cb.fire_before_iteration(iteration, agent=self)
+            await cb.afire_iteration_start(iteration, agent=self)
+            iteration_extra_kwargs = await cb.afire_before_iteration(iteration, agent=self)
 
             if max_exec_time and (time.monotonic() - start_time) > max_exec_time:
                 raise AgentTimeoutError(max_exec_time)
@@ -1002,7 +1133,7 @@ class AgentLoopMixin:
             except Exception as exc:
                 raise AgentLLMError(exc) from exc
 
-            cb.fire_llm_end(response_text, agent=self, raw=raw, **self._extract_llm_metadata(raw))
+            await cb.afire_llm_end(response_text, agent=self, raw=raw, **self._extract_llm_metadata(raw))
 
             if logger and getattr(logger, "full_output", False):
                 logger.llm_response(response_text, iteration)
@@ -1013,7 +1144,7 @@ class AgentLoopMixin:
                 thought, actions, final_answer = None, [], None
 
             if thought:
-                cb.fire_iteration(iteration, thought, agent=self)
+                await cb.afire_iteration(iteration, thought, agent=self)
                 if logger:
                     logger.thought(thought, iteration)
 
@@ -1021,7 +1152,7 @@ class AgentLoopMixin:
                 memory = getattr(self, "memory", None)
                 if memory:
                     _record_agent_message(memory, final_answer)
-                cb.fire_agent_end(final_answer, agent=self)
+                await cb.afire_agent_end(final_answer, agent=self)
                 if logger:
                     logger.final_answer(final_answer)
                 return final_answer
@@ -1031,7 +1162,7 @@ class AgentLoopMixin:
                 # turn actually produces actions/final_answer, not on every
                 # non-throwing _parser() call, or this can never trip.
                 consecutive_parse_errors += 1
-                cb.fire_parse_error(iteration, response_text, agent=self)
+                await cb.afire_parse_error(iteration, response_text, agent=self)
                 if logger:
                     logger.parse_error(response_text, iteration)
                 if consecutive_parse_errors >= max_parse_errors:
@@ -1057,13 +1188,13 @@ class AgentLoopMixin:
 
                 if logger:
                     logger.tool_call(tool_name, tool_input, iteration)
-                cb.fire_tool_start(tool_name, tool_input, agent=self)
+                await cb.afire_tool_start(tool_name, tool_input, agent=self)
 
                 if approval_callback:
                     is_approved = await _maybe_await(approval_callback(tool_name, tool_input))
                     if not is_approved:
                         denial_result = "Tool call was denied by the approval callback."
-                        cb.fire_tool_end(tool_name, denial_result, agent=self)
+                        await cb.afire_tool_end(tool_name, denial_result, agent=self)
                         step_lines.append(f"Action: {tool_name}({tool_input})")
                         step_lines.append(f"Observation: {denial_result}")
                         continue
@@ -1076,7 +1207,7 @@ class AgentLoopMixin:
                     for tool_name, tool_input in approved
                 ])
                 for (tool_name, tool_input), result in zip(approved, results):
-                    cb.fire_tool_end(tool_name, result, agent=self)
+                    await cb.afire_tool_end(tool_name, result, agent=self)
                     if logger:
                         logger.tool_result(tool_name, result, iteration)
                     step_lines.append(f"Action: {tool_name}({tool_input})")
@@ -1268,10 +1399,10 @@ class AgentLoopMixin:
         for tc in tool_calls:
             if logger:
                 logger.tool_call(tc.name, tc.arguments, iteration)
-            cb.fire_tool_start(tc.name, tc.arguments, agent=self)
+            await cb.afire_tool_start(tc.name, tc.arguments, agent=self)
             if approval_callback and not await _maybe_await(approval_callback(tc.name, tc.arguments)):
                 result = "Tool call was denied by the approval callback."
-                cb.fire_tool_end(tc.name, result, agent=self)
+                await cb.afire_tool_end(tc.name, result, agent=self)
                 denied.append((tc, result))
             else:
                 approved.append(tc)
@@ -1403,8 +1534,8 @@ class AgentLoopMixin:
         messages = self._build_native_messages(query)
 
         for iteration in range(1, max_iterations + 1):
-            cb.fire_iteration_start(iteration, agent=self)
-            iteration_extra_kwargs = cb.fire_before_iteration(iteration, agent=self)
+            await cb.afire_iteration_start(iteration, agent=self)
+            iteration_extra_kwargs = await cb.afire_before_iteration(iteration, agent=self)
 
             if max_exec_time and (time.monotonic() - start_time) > max_exec_time:
                 raise AgentTimeoutError(max_exec_time)
@@ -1425,7 +1556,7 @@ class AgentLoopMixin:
             except Exception as exc:
                 raise AgentLLMError(exc) from exc
 
-            cb.fire_llm_end(
+            await cb.afire_llm_end(
                 response.text if response.is_final_answer else None,
                 agent=self,
                 raw=response.raw,
@@ -1437,7 +1568,7 @@ class AgentLoopMixin:
                 memory = getattr(self, "memory", None)
                 if memory:
                     _record_agent_message(memory, final_answer)
-                cb.fire_agent_end(final_answer, agent=self)
+                await cb.afire_agent_end(final_answer, agent=self)
                 if logger:
                     logger.final_answer(final_answer)
                 return final_answer
@@ -1463,7 +1594,7 @@ class AgentLoopMixin:
                     for tc in approved
                 ])
                 for tc, result in zip(approved, results):
-                    cb.fire_tool_end(tc.name, result, agent=self)
+                    await cb.afire_tool_end(tc.name, result, agent=self)
                     if logger:
                         logger.tool_result(tc.name, result, iteration)
                     calls_and_results.append((tc, result))

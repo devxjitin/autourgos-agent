@@ -11,7 +11,9 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from typing import Any, Dict, List, Optional
 
 import pytest
@@ -256,6 +258,28 @@ def test_exploding_handler_does_not_crash_loop():
     assert result == "ok despite explosion"
 
 
+def test_exploding_handler_is_logged_at_warning_not_debug(caplog):
+    """A middleware bug that makes a hook raise used to be swallowed at
+    DEBUG (invisible at the logging module's default WARNING level), so a
+    buggy handler failed completely silently in normal operation. It must
+    now be visible without opting into DEBUG logging."""
+    import logging
+
+    responses = [
+        json.dumps({"thought": None, "actions": [], "final_answer": "ok despite explosion"}),
+    ]
+    llm = FakeLLM(responses)
+    agent = make_agent(llm, [ECHO_TOOL_DICT], [ExplodingHandler()])
+
+    with caplog.at_level(logging.WARNING, logger="autourgos_agent"):
+        agent.invoke("hello")
+
+    assert any(
+        "ExplodingHandler" in r.message and "on_agent_start" in r.message
+        for r in caplog.records
+    )
+
+
 # -- (c) old-style (no `agent` kwarg) handler still works ---------------------
 
 def test_old_style_handler_backward_compatible():
@@ -333,3 +357,91 @@ async def test_all_hooks_fire_on_successful_async_run():
     assert result == "async result"
     fired = set(rec.hook_names())
     assert {"on_agent_start", "on_agent_end", "on_iteration_start", "on_llm_end"}.issubset(fired)
+
+
+# -- sync hooks no longer block the event loop during ainvoke() ---------------
+#
+# Regression coverage: CallbackManager._fire() used to call every hook
+# synchronously even from the async loop (_arun_loop/_arun_loop_native), so a
+# middleware doing blocking work in on_iteration_start (e.g.
+# autourgos-summarizer's llm.invoke() call, autourgos-hcix's poll()) stalled
+# the whole event loop -- including every other concurrent ainvoke() call
+# sharing that thread -- for the duration of the blocking call. _afire() now
+# offloads a sync hook to a worker thread instead of calling it inline.
+
+class BlockingHandler(CallbackHandler):
+    """A sync (non-async) handler whose on_iteration_start blocks the
+    calling thread for `delay` seconds -- simulating a blocking LLM call or
+    a blocking poll(), same as summarizer/hcix's real hooks."""
+
+    def __init__(self, delay: float) -> None:
+        self.delay = delay
+
+    def on_iteration_start(self, iteration, agent=None, **kwargs):
+        time.sleep(self.delay)
+
+
+def _one_iteration_agent(handlers: List[CallbackHandler]) -> Agent:
+    llm = FakeLLM([json.dumps({"thought": None, "actions": [], "final_answer": "done"})])
+    return make_agent(llm, [ECHO_TOOL_DICT], handlers)
+
+
+@pytest.mark.asyncio
+async def test_blocking_sync_hook_does_not_stall_concurrent_ainvoke_runs():
+    delay = 0.15
+    agent_a = _one_iteration_agent([BlockingHandler(delay)])
+    agent_b = _one_iteration_agent([BlockingHandler(delay)])
+
+    start = time.monotonic()
+    results = await asyncio.gather(agent_a.ainvoke("a"), agent_b.ainvoke("b"))
+    elapsed = time.monotonic() - start
+
+    assert results == ["done", "done"]
+    # If the blocking hook ran inline on the event-loop thread (the old
+    # behavior), these two runs would serialize: ~2*delay. Offloaded to a
+    # worker thread, they overlap: ~delay plus scheduling overhead.
+    assert elapsed < delay * 1.8, f"expected concurrent runs (~{delay}s), took {elapsed}s"
+
+
+@pytest.mark.asyncio
+async def test_async_hook_is_awaited_directly_in_async_loop():
+    """An `async def` hook must be awaited (not offloaded to a thread, not
+    silently left as an un-awaited coroutine)."""
+
+    class AsyncRecordingHandler(CallbackHandler):
+        def __init__(self) -> None:
+            self.iterations: List[int] = []
+
+        async def on_iteration_start(self, iteration, agent=None, **kwargs):
+            await asyncio.sleep(0)  # proves this actually runs as a coroutine
+            self.iterations.append(iteration)
+
+    handler = AsyncRecordingHandler()
+    agent = _one_iteration_agent([handler])
+
+    result = await agent.ainvoke("go")
+
+    assert result == "done"
+    assert handler.iterations == [1]
+
+
+def test_async_hook_also_works_from_sync_invoke():
+    """An `async def` hook defined on a handler must still run to completion
+    when the agent is driven via the sync invoke() (via asyncio.run()),
+    not silently skipped or left as an un-awaited coroutine."""
+
+    class AsyncRecordingHandler(CallbackHandler):
+        def __init__(self) -> None:
+            self.iterations: List[int] = []
+
+        async def on_iteration_start(self, iteration, agent=None, **kwargs):
+            await asyncio.sleep(0)
+            self.iterations.append(iteration)
+
+    handler = AsyncRecordingHandler()
+    agent = _one_iteration_agent([handler])
+
+    result = agent.invoke("go")
+
+    assert result == "done"
+    assert handler.iterations == [1]

@@ -1,5 +1,24 @@
 # Changelog
 
+## 3.1.0
+
+- Fixed: a malformed `actions` shape in the LLM response (e.g. a single
+  object instead of a list of `{action, action_input}` dicts) crashed the
+  loop with an uncaught `AttributeError` instead of being treated as a
+  parse error like every other malformed-JSON case.
+- Fixed: `invoke(query, max_iterations=0)`/`ainvoke(..., max_iterations=0)`
+  silently fell back to the instance default instead of honoring the
+  explicit override (`max_iterations or self.max_iterations` treated `0`
+  as falsy).
+- Added: `CallbackManager` now supports async hooks (`async def` handlers)
+  from both `invoke()` and `ainvoke()`. From the async loop, a sync hook
+  now runs off the event-loop thread instead of inline, so a blocking call
+  inside it no longer stalls other concurrent `ainvoke()` runs sharing that
+  thread.
+- Changed: hook exceptions swallowed by `CallbackManager` now log at
+  `WARNING` instead of `DEBUG`, so a buggy middleware handler is visible at
+  default log levels.
+
 ## 3.0.0
 
 - **Breaking:** removed the `backend="kernel"` bridge and everything it

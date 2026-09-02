@@ -4,13 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autourgos-agent"
-version = "3.1.0"
+version = "3.1.1"
 description = "Self-contained, general-purpose LLM agent for the Autourgos framework — works with any OpenAI-compatible LLM"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 authors = [
     { name = "Jitin Kumar Sengar", email = "devxjitin@gmail.com" },
+]
+maintainers = [
+    {name = "Sonia"},
+    {name = "Vishwanil Suman"},
 ]
 keywords = [
     "autourgos", "agent", "reasoning", "acting",

@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://pypi.org/project/autourgos-agent/)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-green.svg)](https://github.com/devxjitin/autourgos-agent/blob/main/LICENSE)
 [![Author](https://img.shields.io/badge/Author-Jitin%20Kumar%20Sengar-blue.svg)](https://github.com/devxjitin)
-[![Maintainer](https://img.shields.io/badge/Maintainer-Sonia-blueviolet.svg)]()
+[![Maintainer](https://img.shields.io/badge/Maintainer-Sonia-blueviolet.svg)](https://github.com/dahiyasonia)
 [![Maintainer](https://img.shields.io/badge/Maintainer-Vishwanil%20Suman-blueviolet.svg)]()
 
 A self-contained **general-purpose LLM agent** for the Autourgos framework.

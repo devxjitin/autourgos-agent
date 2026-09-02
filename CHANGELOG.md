@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.1.1
+
+- Metadata: added `maintainers` (Sonia, Vishwanil Suman) to `pyproject.toml`,
+  and linked the README's existing Sonia maintainer badge to her GitHub
+  profile (https://github.com/dahiyasonia). No code changes.
+
 ## 3.1.0
 
 - Fixed: a malformed `actions` shape in the LLM response (e.g. a single

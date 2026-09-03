@@ -152,7 +152,7 @@ def _make_response_llm(**kwargs: Any) -> OpenAIResponse:
 def test_native_mode_with_real_openairesponse_llm():
     llm = _make_response_llm()
     responses = [_responses_tool_call("add", {"a": 3, "b": 4}), _responses_text("7")]
-    llm._attempt_sync_create = MagicMock(side_effect=lambda client, params, label: responses.pop(0))
+    llm._attempt_sync_create = MagicMock(side_effect=lambda client, params, label, deadline=None: responses.pop(0))
 
     agent = Agent(llm=llm, tool_calling_mode="native", max_iterations=5)
     agent.add_tools(_ADD_TOOL)
@@ -182,7 +182,7 @@ def test_native_mode_concurrent_tool_calls_with_real_openairesponse_llm():
     ]
     multi_call.usage = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
     responses = [multi_call, _responses_text("done")]
-    llm._attempt_sync_create = MagicMock(side_effect=lambda client, params, label: responses.pop(0))
+    llm._attempt_sync_create = MagicMock(side_effect=lambda client, params, label, deadline=None: responses.pop(0))
 
     agent = Agent(llm=llm, tool_calling_mode="native", max_iterations=5)
     agent.add_tools(*tools)

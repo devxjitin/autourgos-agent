@@ -59,7 +59,7 @@ def test_react_agent_with_real_openairesponse_llm_and_on_before_iteration_overri
     llm = _make_llm()
     captured: Dict[str, Any] = {}
 
-    def fake_attempt(client, params, label):
+    def fake_attempt(client, params, label, deadline=None):
         captured.update(params)
         return _mock_response_obj(json.dumps({"thought": None, "actions": [], "final_answer": "42"}))
 

@@ -232,8 +232,17 @@ def _call_sync_approval(
 
 
 def _tool_name(tool: Any) -> Optional[str]:
-    """Duck-typed tool name lookup: plain dicts and Tool (dict subclass) alike."""
-    return tool.get("name") if isinstance(tool, dict) else getattr(tool, "name", None)
+    """Duck-typed tool name lookup: plain dicts and Tool (dict subclass)
+    alike, falling back to a bare callable's __name__ if it has neither a
+    "name" key nor a .name attribute -- needed by consumers (e.g.
+    autourgos-toolbox's Toolbox) whose tool lists can hold raw, unnormalized
+    callables, not just this package's own always-normalized dict shape."""
+    if isinstance(tool, dict):
+        return tool.get("name")
+    name = getattr(tool, "name", None)
+    if name is not None:
+        return name
+    return getattr(tool, "__name__", None) if callable(tool) else None
 
 
 def _tool_func(tool: Any) -> Optional[Callable[..., Any]]:

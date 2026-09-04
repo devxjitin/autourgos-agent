@@ -1,5 +1,9 @@
 # Changelog
 
+## [3.1.6] - 2026-09-05
+
+- `_tool_name()` gains a bare-callable fallback (`__name__`) for tools with neither a `"name"` key nor a `.name` attribute -- so `autourgos-toolbox` can import and share this function instead of reimplementing an equivalent lookup for its own unnormalized (`StructuredTool`/raw-callable) tool lists. Additive only; agent's own tool lists are always pre-normalized dicts and never hit the new branch.
+
 ## [3.1.5] - 2026-09-04
 
 - Internal: `_call_llm_with_retry()`/`_acall_llm_with_retry()` now delegate to `autourgos_core.retry_with_backoff()`/`aretry_with_backoff()` (bumped `autourgos-core>=0.6.0`). No functional change -- backoff formula, `llm_retries`/`llm_retry_backoff`/`llm_retry_max_backoff`/`llm_retry_on` semantics, and logging all preserved (hand-verified attempt-by-attempt against the old loop, plus a new dedicated `tests/test_llm_retry.py` since none existed before). Live-verified against real Azure.

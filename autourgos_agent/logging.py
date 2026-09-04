@@ -132,6 +132,16 @@ class AgentLogger:
     def info(self, message: str) -> None:
         self._emit(_GREY, f"Info: {message}")
 
+    def warning(self, message: str) -> None:
+        """
+        Duck-typed to match the standard-library logging.Logger interface's
+        .warning(message) -- middleware packages (e.g. autourgos-hcix's
+        CognitiveInterruptManager.poll()) pass agent.logger into code that
+        expects a logger-shaped object exposing at least .info()/.warning(),
+        matching this class's existing .info() method.
+        """
+        self._emit(_RED, f"Warning: {message}")
+
     def middleware(self, source: str, message: str) -> None:
         """
         Narrate what a middleware/callback handler is doing, e.g. toolbox

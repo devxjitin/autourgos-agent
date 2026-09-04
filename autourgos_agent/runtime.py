@@ -1,15 +1,19 @@
 """
 runtime.py — Tool helpers for autourgos-agent.
 
-build_tool_list   : formats tool dicts into a prompt-ready string
-parse_json_object : extracts the first JSON object from LLM text
+build_tool_list      : formats tool dicts into a prompt-ready string
+parse_json_object    : extracts the first JSON object from LLM text
+inject_prompt_block  : prepend a text block to agent.system_prompt (or
+                        prompt_template), order-independent across multiple
+                        middleware
+remove_prompt_block  : undo exactly one inject_prompt_block() call
 """
 
 from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 def build_tool_list(tools: List[Any]) -> str:
@@ -109,3 +113,77 @@ def parse_json_object(text: str) -> Dict[str, Any]:
                     continue
 
     return {}
+
+
+# ── Prompt block injection ──────────────────────────────────────────────────
+# Shared primitive for middleware that needs to prepend text into an agent's
+# system_prompt (or prompt_template as a fallback for a non-Agent-shaped
+# host) at runtime and later undo exactly that insertion -- e.g.
+# autourgos-toolbox announcing a newly-exposed toolbox, autourgos-skills
+# announcing a loaded skill, autourgos-hcix injecting a human override.
+#
+# Multiple such middleware can be attached to the same agent at once, in any
+# registration order, and each may inject/remove several times over one run
+# (toolbox: once per expose_toolbox() call; hcix: once per human interrupt).
+# A "snapshot the whole string before, restore the whole string after" design
+# (what every one of these packages originally did independently) is
+# order-dependent: whichever middleware's on_agent_end fires *last* wins,
+# clobbering any restore an earlier middleware already did, and the middleware
+# that registered *second* would have snapshotted the *first* middleware's
+# already-injected text as if it were the original base -- so restoring never
+# actually gets back to the true original, and the leaked text grows every
+# run.
+#
+# The fix: never snapshot or assume anything about "the original" value.
+# Each caller tracks only the exact literal string ITS OWN calls inserted
+# (the return value of inject_prompt_block()) and, on cleanup, removes only
+# that exact substring -- correct regardless of what any other middleware
+# does before, after, or in between, and regardless of registration order.
+
+def inject_prompt_block(agent: Any, text: str, *, prepend: bool = True) -> Optional[str]:
+    """
+    Add ``text`` to ``agent.system_prompt`` (falling back to
+    ``agent.prompt_template`` for a host that doesn't expose the former) --
+    prepended (default) or appended, per ``prepend``.
+
+    Returns the exact string this call inserted -- ``text`` alone if the
+    prior value was empty/None, or ``text`` plus a ``"\\n\\n"`` separator
+    (leading when appending, trailing when prepending) when combined with
+    existing non-empty content -- so a later ``remove_prompt_block()`` call
+    can undo precisely this insertion. Returns None if the agent exposes
+    neither attribute (nothing was injected).
+    """
+    for attr in ("system_prompt", "prompt_template"):
+        if not hasattr(agent, attr):
+            continue
+        current = getattr(agent, attr)
+        if not current:
+            setattr(agent, attr, text)
+            return text
+        if prepend:
+            inserted = f"{text}\n\n"
+            setattr(agent, attr, inserted + current)
+        else:
+            inserted = f"\n\n{text}"
+            setattr(agent, attr, current + inserted)
+        return inserted
+    return None
+
+
+def remove_prompt_block(agent: Any, inserted: Optional[str]) -> None:
+    """
+    Undo exactly one ``inject_prompt_block()`` call, given the exact string
+    it returned.
+
+    No-op if ``inserted`` is falsy, if the agent exposes neither
+    ``system_prompt`` nor ``prompt_template``, or if that literal substring
+    is no longer present (already removed, or the agent's prompt was reset
+    externally) -- removes at most one occurrence, so a coincidental repeat
+    of the same text elsewhere is left untouched.
+    """
+    if not inserted:
+        return
+    if hasattr(agent, "system_prompt") and isinstance(agent.system_prompt, str):
+        agent.system_prompt = agent.system_prompt.replace(inserted, "", 1)
+    elif hasattr(agent, "prompt_template") and isinstance(agent.prompt_template, str):
+        agent.prompt_template = agent.prompt_template.replace(inserted, "", 1)

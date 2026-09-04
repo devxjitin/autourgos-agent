@@ -152,12 +152,35 @@ def _make_response_llm(**kwargs: Any) -> OpenAIResponse:
 def test_native_mode_with_real_openairesponse_llm():
     llm = _make_response_llm()
     responses = [_responses_tool_call("add", {"a": 3, "b": 4}), _responses_text("7")]
-    llm._attempt_sync_create = MagicMock(side_effect=lambda client, params, label, deadline=None: responses.pop(0))
+    sent_params = []
+
+    def _fake_create(client, params, label, deadline=None):
+        sent_params.append(params)
+        return responses.pop(0)
+
+    llm._attempt_sync_create = MagicMock(side_effect=_fake_create)
 
     agent = Agent(llm=llm, tool_calling_mode="native", max_iterations=5)
     agent.add_tools(_ADD_TOOL)
     result = agent.invoke("what is 3+4?")
     assert result == "7"
+
+    # Regression: autourgos-agent's native loop builds Chat-Completions-shaped
+    # {"role": "assistant", "tool_calls": [...]} / {"role": "tool", ...}
+    # messages -- the Responses API has no such item types and rejects them
+    # outright. The second call's `input` must carry the Responses API's own
+    # function_call/function_call_output item shapes instead, never a raw
+    # "tool_calls" key or "role": "tool" message.
+    second_call_input = sent_params[1]["input"]
+    assert not any(
+        isinstance(item, dict) and (item.get("role") == "tool" or "tool_calls" in item)
+        for item in second_call_input
+    )
+    function_call_items = [i for i in second_call_input if isinstance(i, dict) and i.get("type") == "function_call"]
+    output_items = [i for i in second_call_input if isinstance(i, dict) and i.get("type") == "function_call_output"]
+    assert function_call_items and function_call_items[0]["call_id"] == "call_1"
+    assert function_call_items[0]["name"] == "add"
+    assert output_items and output_items[0] == {"type": "function_call_output", "call_id": "call_1", "output": "7"}
 
 
 def test_native_mode_concurrent_tool_calls_with_real_openairesponse_llm():

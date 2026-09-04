@@ -10,6 +10,7 @@ third-party or autourgos-* dependency.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import inspect
 import json
 import logging
@@ -400,6 +401,22 @@ class CallbackManager:
     def __init__(self, handlers: Optional[List[CallbackHandler]] = None) -> None:
         self._handlers: List[CallbackHandler] = list(handlers or [])
         self._hook_executor: Optional[ThreadPoolExecutor] = None
+        # Holds the *current async run's* contextvars.Context, so a sync
+        # hook offloaded to _hook_executor (which does not run on the
+        # event-loop thread, and therefore never sees ambient contextvar
+        # writes on its own) can still read/write ContextVar-scoped
+        # per-run state that another hook in the SAME run set earlier --
+        # see capture_run_context()'s docstring for why this has to be one
+        # reused Context object per run rather than a fresh copy per call.
+        #
+        # This is itself a ContextVar (not a plain attribute) specifically
+        # so concurrent ainvoke() runs sharing this one CallbackManager
+        # instance -- each typically its own asyncio Task, with its own
+        # copied ambient context -- each see only their own run's Context
+        # object here, never another concurrent run's.
+        self._run_context_var: "contextvars.ContextVar[Optional[contextvars.Context]]" = (
+            contextvars.ContextVar(f"autourgos_agent_run_context_{id(self)}", default=None)
+        )
 
     def add_handler(self, handler: CallbackHandler) -> None:
         self._handlers.append(handler)
@@ -411,16 +428,69 @@ class CallbackManager:
             )
         return self._hook_executor
 
-    def _call_with_agent_fallback(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        """Call ``fn(*args, **kwargs)``, retrying without ``agent=`` if the
-        handler's signature doesn't accept it (older/narrower handlers)."""
+    def capture_run_context(self) -> None:
+        """
+        Snapshot the calling task's contextvars.Context and remember it as
+        "this run's context" for every subsequent sync-hook offload to
+        _hook_executor during this async run (_afire / afire_before_iteration).
+
+        Call this once, at the very start of an async run (Agent.ainvoke()
+        does this before firing on_agent_start), NOT before every individual
+        hook call. contextvars.Context.run(callable) only makes a callable's
+        ContextVar writes visible to a LATER Context.run() call on that exact
+        same Context object -- a fresh contextvars.copy_context() per hook
+        call (the naive fix) creates a new, unrelated snapshot each time, so
+        an earlier hook's ContextVar.set() would never be visible to a later
+        hook's read. Reusing one Context object for the whole run, retrieved
+        via self._run_context_var.get() inside _afire, is what actually
+        makes writes and reads made from different hook calls (even nested
+        ones, e.g. concurrent tool-execution hooks under asyncio.gather --
+        each gets its own Task whose context is a copy taken AFTER this
+        Context object was already bound to _run_context_var, so the binding,
+        a reference, carries through) see each other correctly.
+
+        Hooks fired without ever calling this first (e.g. a caller invoking
+        CallbackManager methods directly, outside Agent.ainvoke()) keep the
+        prior behavior exactly: no context reuse, each sync-hook offload
+        just runs on a bare worker thread as before.
+        """
+        self._run_context_var.set(contextvars.copy_context())
+
+    @staticmethod
+    def _accepts_agent_kwarg(fn: Callable[..., Any]) -> bool:
+        """Whether ``fn``'s signature can accept an ``agent=`` keyword --
+        either a named ``agent`` parameter, or a catch-all ``**kwargs``.
+
+        Unintrospectable callables (some builtins/C-implemented callables
+        raise ValueError/TypeError from inspect.signature) are assumed to
+        accept it, matching this method's old default (call with agent=
+        first) for anything it can't actually inspect.
+        """
         try:
-            return fn(*args, **kwargs)
-        except TypeError:
-            if "agent" in kwargs:
-                retry_kwargs = {k: v for k, v in kwargs.items() if k != "agent"}
-                return fn(*args, **retry_kwargs)
-            raise
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return True
+        for param in sig.parameters.values():
+            if param.kind == inspect.Parameter.VAR_KEYWORD or param.name == "agent":
+                return True
+        return False
+
+    def _call_with_agent_fallback(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Call ``fn(*args, **kwargs)``, dropping ``agent=`` first if the
+        handler's signature can't accept it (older/narrower handlers).
+
+        Decided via signature inspection BEFORE calling, not by calling
+        then retrying on TypeError -- retry-on-TypeError previously meant
+        a handler whose OWN body raised an unrelated TypeError (a bug
+        inside the handler, nothing to do with its signature) got silently
+        called a second time, since that TypeError looked identical to a
+        "doesn't accept agent=" signature mismatch. Any side-effecting
+        handler (writing a file, incrementing a counter, sending a
+        notification) would double its side effect for that single event.
+        """
+        if "agent" in kwargs and not self._accepts_agent_kwarg(fn):
+            kwargs = {k: v for k, v in kwargs.items() if k != "agent"}
+        return fn(*args, **kwargs)
 
     def _fire(self, method: str, *args: Any, **kwargs: Any) -> None:
         for h in self._handlers:
@@ -458,11 +528,27 @@ class CallbackManager:
                     # blocking llm.invoke() inside on_iteration_start
                     # doesn't stall every other concurrent ainvoke() run
                     # sharing this thread for its whole duration.
+                    #
+                    # Reuse THIS run's captured Context (see
+                    # capture_run_context()) so a ContextVar a hook sets
+                    # here is visible to a later hook call in the same run
+                    # -- run_in_executor itself never propagates contextvar
+                    # writes back on its own. Falls back to a bare call
+                    # (identical to prior behavior) if nothing captured a
+                    # run context (e.g. CallbackManager used directly,
+                    # outside Agent.ainvoke()).
                     loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(
-                        self._get_hook_executor(),
-                        lambda: self._call_with_agent_fallback(fn, *args, **kwargs),
-                    )
+                    run_ctx = self._run_context_var.get()
+                    if run_ctx is not None:
+                        await loop.run_in_executor(
+                            self._get_hook_executor(),
+                            lambda: run_ctx.run(self._call_with_agent_fallback, fn, *args, **kwargs),
+                        )
+                    else:
+                        await loop.run_in_executor(
+                            self._get_hook_executor(),
+                            lambda: self._call_with_agent_fallback(fn, *args, **kwargs),
+                        )
             except Exception:
                 _logger.warning(
                     "Callback handler %s raised in %s",
@@ -505,10 +591,16 @@ class CallbackManager:
             if not callable(fn):
                 continue
             try:
-                try:
-                    result = fn(iteration, agent=agent, **kw)
-                except TypeError:
-                    result = fn(iteration, **kw)
+                # See _call_with_agent_fallback's identical comment: decide
+                # via signature inspection, not by calling then retrying on
+                # TypeError -- a retry-on-TypeError here would silently
+                # call fn a second time (with a real side effect, e.g. a
+                # screenshot capture or a file write) if its OWN body
+                # raised an unrelated TypeError.
+                call_kwargs = dict(kw)
+                if self._accepts_agent_kwarg(fn):
+                    call_kwargs["agent"] = agent
+                result = fn(iteration, **call_kwargs)
             except Exception:
                 _logger.warning(
                     "Callback handler %s raised in on_before_iteration",
@@ -563,22 +655,34 @@ class CallbackManager:
             if not callable(fn):
                 continue
             try:
+                # See _call_with_agent_fallback's identical comment: decide
+                # via signature inspection, not by calling then retrying on
+                # TypeError -- a retry-on-TypeError would silently call fn
+                # a second time if its OWN body raised an unrelated
+                # TypeError, doubling any real side effect.
+                call_kwargs = dict(kw)
+                if self._accepts_agent_kwarg(fn):
+                    call_kwargs["agent"] = agent
+
                 if inspect.iscoroutinefunction(fn):
-                    try:
-                        result = await fn(iteration, agent=agent, **kw)
-                    except TypeError:
-                        result = await fn(iteration, **kw)
+                    result = await fn(iteration, **call_kwargs)
                 else:
+                    # See _afire's identical comment: reuse this run's
+                    # captured Context (capture_run_context()) so a
+                    # ContextVar write here is visible to a later hook call
+                    # in the same run; falls back to a bare call when no
+                    # run context was captured.
                     loop = asyncio.get_running_loop()
-                    try:
+                    run_ctx = self._run_context_var.get()
+                    if run_ctx is not None:
                         result = await loop.run_in_executor(
                             self._get_hook_executor(),
-                            lambda: fn(iteration, agent=agent, **kw),
+                            lambda: run_ctx.run(fn, iteration, **call_kwargs),
                         )
-                    except TypeError:
+                    else:
                         result = await loop.run_in_executor(
                             self._get_hook_executor(),
-                            lambda: fn(iteration, **kw),
+                            lambda: fn(iteration, **call_kwargs),
                         )
             except Exception:
                 _logger.warning(

@@ -1,5 +1,13 @@
 # Changelog
 
+## [3.2.0] - 2026-09-05
+
+- **Fixed:** `CallbackManager._call_with_agent_fallback` (and the 3 duplicated `on_before_iteration`/`on_after_iteration` call sites) decided whether a handler accepts `agent=` by calling it and retrying on `TypeError` -- so a handler whose own body raised an unrelated `TypeError` got silently called a SECOND time, doubling any real side effect. Now decided up front via signature inspection (`_accepts_agent_kwarg`).
+- **Fixed:** sync hooks offloaded to `CallbackManager`'s worker thread under `ainvoke()` didn't propagate `contextvars.ContextVar` writes between hook calls in the same run (a fresh `copy_context()` per call is a disconnected snapshot). Added `capture_run_context()` (called once per run by `Agent.ainvoke()`), reusing one `contextvars.Context` object for the whole run so ContextVar-scoped middleware state (e.g. autourgos-history's per-run state) is visible across hook calls.
+- **Fixed:** `AgentLogger` had no `.warning()` method despite being duck-typed as a logger-shaped object by middleware (e.g. autourgos-hcix) that calls `.warning()` on it -- crashed with `AttributeError`, silently swallowed since it ran from inside a hook.
+- Added: `inject_prompt_block()`/`remove_prompt_block()` in `runtime.py`, exported from the package root. Shared primitive for middleware that prepends/appends text into `agent.system_prompt`/`prompt_template` at runtime and needs to undo exactly that insertion later -- order-independent across multiple middleware, unlike a whole-string snapshot/restore (which is order-dependent and leaks text when middleware register/act in overlapping runs). Used by autourgos-toolbox, candidate for autourgos-skills/autourgos-hcix too.
+- Regression coverage added for all of the above, plus a new assertion on `OpenAIResponse` native tool-calling that the Responses API's own `function_call`/`function_call_output` item shapes are sent (never a Chat-Completions-shaped `"role": "tool"`/`"tool_calls"` message).
+
 ## [3.1.6] - 2026-09-05
 
 - `_tool_name()` gains a bare-callable fallback (`__name__`) for tools with neither a `"name"` key nor a `.name` attribute -- so `autourgos-toolbox` can import and share this function instead of reimplementing an equivalent lookup for its own unnormalized (`StructuredTool`/raw-callable) tool lists. Additive only; agent's own tool lists are always pre-normalized dicts and never hit the new branch.

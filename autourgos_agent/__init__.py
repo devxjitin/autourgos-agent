@@ -36,7 +36,7 @@ from .base    import (
     AgentEmptyResponseError,
 )
 from .logging import AgentLogger
-from .runtime import build_tool_list, parse_json_object
+from .runtime import build_tool_list, parse_json_object, inject_prompt_block, remove_prompt_block
 from .tool    import tool, Tool
 
 # v1 backward-compat alias
@@ -79,6 +79,8 @@ __all__ = [
     "AgentLogger",
     "build_tool_list",
     "parse_json_object",
+    "inject_prompt_block",
+    "remove_prompt_block",
     # tool decorator
     "tool",
     "Tool",

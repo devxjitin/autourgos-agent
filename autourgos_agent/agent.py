@@ -303,6 +303,16 @@ class Agent(AgentLoopMixin, BaseAgent):
                 self.memory.add_user_message(query)
                 self.logger.memory_action("Added user message to memory.")
 
+            # Capture this run's contextvars.Context ONCE, before the first
+            # hook fires, so a sync hook offloaded to a worker thread
+            # (CallbackManager._afire/afire_before_iteration) reuses the
+            # same Context across every hook call for this run instead of
+            # a fresh, disconnected copy each time -- required for a
+            # ContextVar-scoped middleware (e.g. autourgos-history's
+            # per-run state) to see its own earlier writes. See
+            # CallbackManager.capture_run_context()'s docstring.
+            self.callback_manager.capture_run_context()
+
             await self.callback_manager.afire_agent_start(query, agent=self)
             self.logger.run_start(query)
 

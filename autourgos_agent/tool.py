@@ -37,10 +37,11 @@ from __future__ import annotations
 
 import functools
 import inspect
-import re
 import types as _types
 import typing
 from typing import Any, Callable, Dict, List, Optional
+
+from autourgos_core import parse_param_descriptions
 
 __all__ = ["tool", "Tool"]
 
@@ -67,13 +68,6 @@ _JSON_TYPE_NAME_MAP: Dict[str, str] = {
     "List": "array",
     "Dict": "object",
 }
-
-_SECTION_HEADER_RE = re.compile(r"^(Args|Arguments|Parameters)\s*:?\s*$", re.IGNORECASE)
-_NEXT_SECTION_RE = re.compile(
-    r"^(Returns?|Raises|Yields?|Examples?|Note|Notes)\s*:?\s*$", re.IGNORECASE
-)
-_PARAM_LINE_RE = re.compile(r"^(\w+)\s*(?:\([^)]*\))?\s*:\s*(.+)$")
-
 
 def _split_top_level(text: str) -> List[str]:
     """Split on commas, ignoring ones nested inside [...] (e.g. Dict[str, int])."""
@@ -143,26 +137,7 @@ def _json_type_for(annotation: Any) -> str:
 
 def _parse_docstring_param_descriptions(doc: Optional[str]) -> Dict[str, str]:
     """Best-effort extraction of name/description lines from an Args section."""
-    descriptions: Dict[str, str] = {}
-    if not doc:
-        return descriptions
-
-    in_args_section = False
-    for raw_line in doc.splitlines():
-        line = raw_line.strip()
-        if _SECTION_HEADER_RE.match(line):
-            in_args_section = True
-            continue
-        if not in_args_section:
-            continue
-        if not line:
-            continue
-        if _NEXT_SECTION_RE.match(line):
-            break
-        match = _PARAM_LINE_RE.match(line)
-        if match:
-            descriptions[match.group(1)] = match.group(2).strip()
-    return descriptions
+    return parse_param_descriptions(doc)
 
 
 def _infer_parameters(func: Callable[..., Any]) -> Dict[str, Any]:

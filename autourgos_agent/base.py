@@ -2,7 +2,9 @@
 base.py — Self-contained base classes for autourgos-agent.
 
 Inlines BaseLLM, BaseAgent, AgentLoopMixin, CallbackManager, and all
-protocols so the package has zero dependency on autourgos-core.
+protocols. Depends only on autourgos-core (a separate, zero-dependency
+stdlib utility library shared across the framework) -- no other
+third-party or autourgos-* dependency.
 """
 
 from __future__ import annotations
@@ -17,6 +19,8 @@ from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as _FutureTimeoutError
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from autourgos_core import extract_text as _extract_text_fn
 
 from .runtime import build_tool_list
 
@@ -657,9 +661,7 @@ class AgentLoopMixin:
 
     def _extract_text(self, raw: Any) -> str:
         """Normalise LLM output to a plain string."""
-        if isinstance(raw, dict):
-            return raw.get("response", str(raw))
-        return str(raw)
+        return _extract_text_fn(raw)
 
     def _extract_llm_metadata(self, raw: Any) -> Dict[str, Any]:
         """Best-effort usage/cost/latency extraction from a raw LLM response.

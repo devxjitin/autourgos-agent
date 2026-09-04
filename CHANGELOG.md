@@ -1,5 +1,9 @@
 # Changelog
 
+## [3.1.4] - 2026-09-04
+
+- Internal: `_extract_text()` and `tool.py`'s `_parse_docstring_param_descriptions()` now delegate to `autourgos_core.extract_text()`/`parse_param_descriptions()` (bumped `autourgos-core>=0.4.0`). No functional change for this package.
+
 ## [3.1.3] - 2026-09-04
 
 - Internal: `__version__` resolution moved to `autourgos_core.package_version()` (new `autourgos-core>=0.3.0` dependency). "No autourgos-core dependency" in the README referred to the old, since-removed v3 "typed vocabulary" `autourgos-core` package -- the new `autourgos-core` is a separate, zero-dependency stdlib utility library; README wording updated to clarify "no *third-party* dependencies". No functional change.

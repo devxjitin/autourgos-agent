@@ -11,7 +11,7 @@ A self-contained **general-purpose LLM agent** for the Autourgos framework.
 
 The agent alternates between **Thought** (reasoning about what to do next) and **Action** (calling a tool), looping until it has enough information to give a **Final Answer**.
 
-Fully self-contained — no `autourgos-core` dependency. Zero required dependencies beyond Python 3.10+. Plug in any LLM wrapper you already have.
+Fully self-contained — no *third-party* dependencies beyond Python 3.10+ (only `autourgos-core`, itself a zero-dependency stdlib utility library shared across the framework). Plug in any LLM wrapper you already have.
 
 ---
 
@@ -79,7 +79,7 @@ This continues until the agent has a final answer or hits the iteration/time lim
 pip install autourgos-agent
 ```
 
-No required runtime dependencies. Bring your own LLM wrapper:
+No required third-party runtime dependencies (only `autourgos-core`, zero-dep itself). Bring your own LLM wrapper:
 
 ```bash
 pip install autourgos-openaichat   # Chat Completions API

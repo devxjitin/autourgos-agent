@@ -54,11 +54,9 @@ def Create_Agent(*args: object, **kwargs: object) -> Agent:
     return Agent(*args, **kwargs)
 
 
-try:
-    from importlib.metadata import version as _meta_version, PackageNotFoundError as _PNF
-    __version__ = _meta_version("autourgos-agent")
-except Exception:
-    __version__ = "3.1.2"
+from autourgos_core import package_version
+
+__version__ = package_version("autourgos-agent", fallback="3.1.3")
 
 __all__ = [
     "Agent",

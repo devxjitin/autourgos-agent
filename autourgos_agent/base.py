@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as _FutureTimeoutError
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from autourgos_core import extract_text as _extract_text_fn
+from autourgos_core import aretry_with_backoff, extract_text as _extract_text_fn, retry_with_backoff
 
 from .runtime import build_tool_list
 
@@ -817,21 +817,17 @@ class AgentLoopMixin:
         should_retry: Callable[[BaseException], bool] = getattr(self, "llm_retry_on", None) or _default_should_retry
         logger = getattr(self, "logger", None)
 
-        attempt = 0
-        while True:
-            try:
-                return fn()
-            except Exception as exc:
-                if attempt >= retries or not should_retry(exc):
-                    raise
-                delay = min(backoff * (2 ** attempt), max_backoff)
-                if logger:
-                    logger.info(
-                        f"LLM call failed ({exc}); retrying in {delay:.1f}s "
-                        f"(attempt {attempt + 1}/{retries})."
-                    )
-                time.sleep(delay)
-                attempt += 1
+        def _on_retry(exc: BaseException, attempt: int, delay: float) -> None:
+            if logger:
+                logger.info(
+                    f"LLM call failed ({exc}); retrying in {delay:.1f}s "
+                    f"(attempt {attempt}/{retries})."
+                )
+
+        return retry_with_backoff(
+            fn, max_attempts=retries + 1, backoff_base=backoff, max_backoff=max_backoff,
+            should_retry=should_retry, on_retry=_on_retry,
+        )
 
     async def _acall_llm_with_retry(self, coro_fn: Callable[[], Any]) -> Any:
         """Async twin of _call_llm_with_retry -- ``coro_fn`` is a zero-arg
@@ -844,21 +840,17 @@ class AgentLoopMixin:
         should_retry: Callable[[BaseException], bool] = getattr(self, "llm_retry_on", None) or _default_should_retry
         logger = getattr(self, "logger", None)
 
-        attempt = 0
-        while True:
-            try:
-                return await coro_fn()
-            except Exception as exc:
-                if attempt >= retries or not should_retry(exc):
-                    raise
-                delay = min(backoff * (2 ** attempt), max_backoff)
-                if logger:
-                    logger.info(
-                        f"LLM call failed ({exc}); retrying in {delay:.1f}s "
-                        f"(attempt {attempt + 1}/{retries})."
-                    )
-                await asyncio.sleep(delay)
-                attempt += 1
+        def _on_retry(exc: BaseException, attempt: int, delay: float) -> None:
+            if logger:
+                logger.info(
+                    f"LLM call failed ({exc}); retrying in {delay:.1f}s "
+                    f"(attempt {attempt}/{retries})."
+                )
+
+        return await aretry_with_backoff(
+            coro_fn, max_attempts=retries + 1, backoff_base=backoff, max_backoff=max_backoff,
+            should_retry=should_retry, on_retry=_on_retry,
+        )
 
     def _collect_future_result(self, tool_name: str, future: Any, timeout: Optional[float]) -> str:
         """Block on a submitted tool future, enforcing ``tool_timeout``.

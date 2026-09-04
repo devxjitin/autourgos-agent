@@ -1,5 +1,9 @@
 # Changelog
 
+## [3.1.5] - 2026-09-04
+
+- Internal: `_call_llm_with_retry()`/`_acall_llm_with_retry()` now delegate to `autourgos_core.retry_with_backoff()`/`aretry_with_backoff()` (bumped `autourgos-core>=0.6.0`). No functional change -- backoff formula, `llm_retries`/`llm_retry_backoff`/`llm_retry_max_backoff`/`llm_retry_on` semantics, and logging all preserved (hand-verified attempt-by-attempt against the old loop, plus a new dedicated `tests/test_llm_retry.py` since none existed before). Live-verified against real Azure.
+
 ## [3.1.4] - 2026-09-04
 
 - Internal: `_extract_text()` and `tool.py`'s `_parse_docstring_param_descriptions()` now delegate to `autourgos_core.extract_text()`/`parse_param_descriptions()` (bumped `autourgos-core>=0.4.0`). No functional change for this package.

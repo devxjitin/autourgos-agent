@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autourgos-agent"
-version = "3.1.4"
+version = "3.1.5"
 description = "Self-contained, general-purpose LLM agent for the Autourgos framework — works with any OpenAI-compatible LLM"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -35,7 +35,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "autourgos-core>=0.4.0",
+    "autourgos-core>=0.6.0",
 ]
 
 [project.optional-dependencies]

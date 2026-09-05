@@ -630,6 +630,8 @@ every tool — call `agent.ainvoke()` instead, or use a plain sync callback.
 
 Register event hooks to observe the agent without modifying it. `CallbackHandler` exposes 11 hooks in total: `on_agent_start`, `on_agent_end`, `on_agent_error`, `on_tool_start`, `on_tool_end`, `on_tool_error`, `on_iteration_start`, `on_before_iteration`, `on_iteration`, `on_llm_end`, and `on_parse_error`. Every hook may receive an `agent=<Agent instance>` kwarg (older handlers that don't accept it still work).
 
+**`on_agent_error` also fires on cancellation.** `invoke()`/`ainvoke()` catch `BaseException`, not just `Exception`, so `on_agent_error` is guaranteed to fire — exactly once, with a bare re-raise afterward — for an ordinary exception, a cancelled async run (`asyncio.CancelledError`), or a `KeyboardInterrupt`/`SystemExit` mid-run. Do cleanup that must always happen (removing tools/prompt blocks your middleware injected, stopping a listener, flushing a log, deleting temp files) in `on_agent_error`, not just `on_agent_end` — otherwise a cancelled run silently skips it. If your handler treats `on_agent_error` as "a real application failure occurred" (e.g. alerting), check `isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit))` to distinguish cancellation from an actual error.
+
 ```python
 from autourgos_agent import Agent, CallbackHandler
 

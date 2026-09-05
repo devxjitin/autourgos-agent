@@ -273,7 +273,13 @@ class Agent(AgentLoopMixin, BaseAgent):
                 approval_callback=self.approval_callback,
                 extra_kwargs=kwargs,
             )
-        except Exception as exc:
+        except BaseException as exc:
+            # BaseException (not Exception) so a KeyboardInterrupt/SystemExit
+            # mid-run still fires on_agent_error -- middleware (skills,
+            # toolbox, hcix, history, preiteration) all do their cleanup
+            # (removing injected tools/prompt blocks, stopping listeners,
+            # flushing logs, deleting temp files) exclusively there. Bare
+            # `raise` re-propagates it completely unchanged.
             self.callback_manager.fire_agent_error(exc, agent=self)
             raise
         finally:
@@ -329,7 +335,11 @@ class Agent(AgentLoopMixin, BaseAgent):
                 approval_callback=self.approval_callback,
                 extra_kwargs=kwargs,
             )
-        except Exception as exc:
+        except BaseException as exc:
+            # BaseException (not Exception) so asyncio.CancelledError (a
+            # BaseException subclass, not Exception, since Python 3.8) mid-run
+            # still fires on_agent_error -- see invoke()'s identical comment.
+            # Bare `raise` re-propagates cancellation completely unchanged.
             await self.callback_manager.afire_agent_error(exc, agent=self)
             raise
         finally:

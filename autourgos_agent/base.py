@@ -775,6 +775,25 @@ class AgentLoopMixin:
         if max_exec_time and (time.monotonic() - start_time) > max_exec_time:
             raise AgentTimeoutError(max_exec_time)
 
+    def _inject_agent_deadline(
+        self, call_kwargs: Dict[str, Any], start_time: float, max_exec_time: Optional[float]
+    ) -> Dict[str, Any]:
+        """Add a reserved ``_agent_deadline_seconds`` kwarg (the run's
+        remaining time) to a fresh copy of ``call_kwargs``, but ONLY if
+        ``self.llm`` explicitly opts in via ``SUPPORTS_AGENT_DEADLINE = True``
+        (default False via getattr). This lets an LLM wrapper's own
+        retry/fallback loop stop early once the agent is nearly out of time,
+        instead of continuing to retry/fall back for its own full budget --
+        see OpenAIChatModel.SUPPORTS_AGENT_DEADLINE's docstring for why this
+        is opt-in rather than always-on: any other duck-typed BaseLLM that
+        forwards unrecognized kwargs straight into request params (as some
+        do) would break if it silently received a kwarg it doesn't expect.
+        """
+        if not max_exec_time or not getattr(self.llm, "SUPPORTS_AGENT_DEADLINE", False):
+            return call_kwargs
+        remaining = max_exec_time - (time.monotonic() - start_time)
+        return {**call_kwargs, "_agent_deadline_seconds": remaining}
+
     def _build_messages(self, prompt_text: str) -> Any:
         """Wrap the rendered prompt in messages list if a system prompt exists."""
         system_prompt: str = getattr(self, "system_prompt", "")
@@ -1088,7 +1107,9 @@ class AgentLoopMixin:
             messages = self._build_messages(prompt_text)
 
             # call LLM
-            call_kwargs = {**extra_kwargs, **iteration_extra_kwargs}
+            call_kwargs = self._inject_agent_deadline(
+                {**extra_kwargs, **iteration_extra_kwargs}, start_time, max_exec_time
+            )
             try:
                 raw = self._call_llm_with_retry(lambda: self.llm.invoke(messages, **call_kwargs))  # type: ignore[attr-defined]
                 response_text = self._extract_text(raw)
@@ -1257,7 +1278,9 @@ class AgentLoopMixin:
             )
             messages = self._build_messages(prompt_text)
 
-            call_kwargs = {**extra_kwargs, **iteration_extra_kwargs}
+            call_kwargs = self._inject_agent_deadline(
+                {**extra_kwargs, **iteration_extra_kwargs}, start_time, max_exec_time
+            )
             try:
                 acall = self._acall_llm_with_retry(lambda: self.llm.ainvoke(messages, **call_kwargs))  # type: ignore[attr-defined]
                 if max_exec_time:
@@ -1595,7 +1618,9 @@ class AgentLoopMixin:
             messages = self._trim_native_messages(messages)
             call_messages = self._native_system_messages(memory_context) + messages
 
-            call_kwargs = {**extra_kwargs, **iteration_extra_kwargs}
+            call_kwargs = self._inject_agent_deadline(
+                {**extra_kwargs, **iteration_extra_kwargs}, start_time, max_exec_time
+            )
             try:
                 response = self._call_llm_with_retry(
                     lambda: self.llm.invoke_with_tools(call_messages, self.tools, **call_kwargs)  # type: ignore[attr-defined]
@@ -1701,7 +1726,9 @@ class AgentLoopMixin:
             messages = self._trim_native_messages(messages)
             call_messages = self._native_system_messages(memory_context) + messages
 
-            call_kwargs = {**extra_kwargs, **iteration_extra_kwargs}
+            call_kwargs = self._inject_agent_deadline(
+                {**extra_kwargs, **iteration_extra_kwargs}, start_time, max_exec_time
+            )
             try:
                 acall = self._acall_llm_with_retry(
                     lambda: self.llm.ainvoke_with_tools(call_messages, self.tools, **call_kwargs)  # type: ignore[attr-defined]

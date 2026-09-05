@@ -350,3 +350,49 @@ async def test_async_loop_sync_approval_callback_still_works():
 
     assert result == "done"
     assert calls == [("echo", {"text": "hi"})]
+
+
+# -- Sprint 1b: opt-in gate for _agent_deadline_seconds -----------------------
+# FRAMEWORK_REVIEW.md Finding #1: the agent's remaining run time is only ever
+# injected as a kwarg into self.llm.invoke()/ainvoke() when the LLM instance
+# explicitly opts in via SUPPORTS_AGENT_DEADLINE = True. A plain duck-typed
+# LLM (no such attribute -- the common case for ScriptedFakeLLM and any
+# custom wrapper) must never receive it, since some wrappers forward
+# unrecognized kwargs straight into a live API call.
+
+def test_plain_llm_without_opt_in_never_receives_agent_deadline_kwarg():
+    received_kwargs = []
+
+    class RecordingLLM:
+        def invoke(self, prompt, **kwargs):
+            received_kwargs.append(kwargs)
+            return json.dumps({"thought": None, "actions": [], "final_answer": "done"})
+
+        async def ainvoke(self, prompt, **kwargs):
+            return self.invoke(prompt, **kwargs)
+
+    agent = Agent(llm=RecordingLLM(), max_iterations=5, max_execution_time=10.0)
+    result = agent.invoke("go")
+
+    assert result == "done"
+    assert all("_agent_deadline_seconds" not in kw for kw in received_kwargs)
+
+
+def test_llm_with_opt_in_receives_agent_deadline_kwarg():
+    received_kwargs = []
+
+    class RecordingLLM:
+        SUPPORTS_AGENT_DEADLINE = True
+
+        def invoke(self, prompt, **kwargs):
+            received_kwargs.append(kwargs)
+            return json.dumps({"thought": None, "actions": [], "final_answer": "done"})
+
+        async def ainvoke(self, prompt, **kwargs):
+            return self.invoke(prompt, **kwargs)
+
+    agent = Agent(llm=RecordingLLM(), max_iterations=5, max_execution_time=10.0)
+    agent.invoke("go")
+
+    assert len(received_kwargs) == 1
+    assert isinstance(received_kwargs[0].get("_agent_deadline_seconds"), float)

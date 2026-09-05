@@ -193,6 +193,25 @@ def test_native_loop_timeout():
         agent.invoke("go")
 
 
+def test_native_loop_single_slow_call_trips_timeout_immediately():
+    """FRAMEWORK_REVIEW.md Finding #1 regression: with max_iterations=1 there
+    is no second iteration for the old top-of-iteration-only deadline check
+    to catch an overrunning call at -- it must be rechecked immediately after
+    invoke_with_tools() returns."""
+    from autourgos_agent import AgentTimeoutError
+
+    class OverrunningNativeLLM(ScriptedToolCallLLM):
+        def invoke_with_tools(self, prompt, tools, **kwargs):
+            time.sleep(0.06)
+            return super().invoke_with_tools(prompt, tools, **kwargs)
+
+    llm = OverrunningNativeLLM([ScriptedToolCallLLM.final("done")])
+    agent = Agent(llm=llm, tool_calling_mode="native", max_iterations=1, max_execution_time=0.01)
+    agent.add_tools(ADD_TOOL)
+    with pytest.raises(AgentTimeoutError):
+        agent.invoke("go")
+
+
 def test_native_loop_fails_fast_when_llm_lacks_invoke_with_tools():
     from autourgos_agent.testing import ScriptedFakeLLM
 

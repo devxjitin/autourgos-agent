@@ -762,6 +762,19 @@ class AgentLoopMixin:
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
+    def _check_deadline(self, start_time: float, max_exec_time: Optional[float]) -> None:
+        """Raise AgentTimeoutError if the run's absolute deadline has already
+        passed. Called both at the top of each iteration (existing behavior)
+        AND immediately after every blocking wait (an LLM call, a tool-result
+        wait, an approval callback) returns -- a blocking call can't be
+        preempted mid-flight (sync Python has no way to force-stop a running
+        call), but this closes the gap where such a call was previously only
+        ever caught one full iteration later, letting the run overrun its
+        declared limit by an arbitrary amount.
+        """
+        if max_exec_time and (time.monotonic() - start_time) > max_exec_time:
+            raise AgentTimeoutError(max_exec_time)
+
     def _build_messages(self, prompt_text: str) -> Any:
         """Wrap the rendered prompt in messages list if a system prompt exists."""
         system_prompt: str = getattr(self, "system_prompt", "")
@@ -1082,6 +1095,11 @@ class AgentLoopMixin:
             except Exception as exc:
                 raise AgentLLMError(exc) from exc
 
+            # Recheck immediately after the call returns -- see
+            # _check_deadline's docstring: a hung/slow call already
+            # completed can still have blown the deadline while it ran.
+            self._check_deadline(start_time, max_exec_time)
+
             cb.fire_llm_end(response_text, agent=self, raw=raw, **self._extract_llm_metadata(raw))
 
             if logger and getattr(logger, "full_output", False):
@@ -1153,7 +1171,12 @@ class AgentLoopMixin:
                 cb.fire_tool_start(tool_name, tool_input, agent=self)
 
                 # approval gate
-                if approval_callback and not _call_sync_approval(approval_callback, tool_name, tool_input):
+                if approval_callback:
+                    is_approved = _call_sync_approval(approval_callback, tool_name, tool_input)
+                    self._check_deadline(start_time, max_exec_time)
+                else:
+                    is_approved = True
+                if approval_callback and not is_approved:
                     denial_result = "Tool call was denied by the approval callback."
                     cb.fire_tool_end(tool_name, denial_result, agent=self)
                     step_lines.append(f"Action: {tool_name}({tool_input})")
@@ -1179,6 +1202,7 @@ class AgentLoopMixin:
                     ]
                     for tool_name, tool_input, future in futures:
                         result = self._collect_future_result(tool_name, future, tool_timeout)
+                        self._check_deadline(start_time, max_exec_time)
                         cb.fire_tool_end(tool_name, result, agent=self)
                         if logger:
                             logger.tool_result(tool_name, result, iteration)
@@ -1235,10 +1259,26 @@ class AgentLoopMixin:
 
             call_kwargs = {**extra_kwargs, **iteration_extra_kwargs}
             try:
-                raw = await self._acall_llm_with_retry(lambda: self.llm.ainvoke(messages, **call_kwargs))  # type: ignore[attr-defined]
+                acall = self._acall_llm_with_retry(lambda: self.llm.ainvoke(messages, **call_kwargs))  # type: ignore[attr-defined]
+                if max_exec_time:
+                    remaining = max_exec_time - (time.monotonic() - start_time)
+                    if remaining <= 0:
+                        raise AgentTimeoutError(max_exec_time)
+                    raw = await asyncio.wait_for(acall, timeout=remaining)
+                else:
+                    raw = await acall
                 response_text = self._extract_text(raw)
+            except AgentTimeoutError:
+                raise
+            except asyncio.TimeoutError:
+                raise AgentTimeoutError(max_exec_time)
             except Exception as exc:
                 raise AgentLLMError(exc) from exc
+
+            # Recheck immediately after the call returns -- see _run_loop's
+            # identical comment: a call that finished just under wait_for's
+            # timeout could still have blown the deadline while it ran.
+            self._check_deadline(start_time, max_exec_time)
 
             await cb.afire_llm_end(response_text, agent=self, raw=raw, **self._extract_llm_metadata(raw))
 
@@ -1299,6 +1339,7 @@ class AgentLoopMixin:
 
                 if approval_callback:
                     is_approved = await _maybe_await(approval_callback(tool_name, tool_input))
+                    self._check_deadline(start_time, max_exec_time)
                     if not is_approved:
                         denial_result = "Tool call was denied by the approval callback."
                         await cb.afire_tool_end(tool_name, denial_result, agent=self)
@@ -1313,6 +1354,7 @@ class AgentLoopMixin:
                     self._execute_tool_async_with_timeout(tool_map, tool_name, tool_input, tool_timeout)
                     for tool_name, tool_input in approved
                 ])
+                self._check_deadline(start_time, max_exec_time)
                 for (tool_name, tool_input), result in zip(approved, results):
                     await cb.afire_tool_end(tool_name, result, agent=self)
                     if logger:
@@ -1563,6 +1605,10 @@ class AgentLoopMixin:
             except Exception as exc:
                 raise AgentLLMError(exc) from exc
 
+            # Recheck immediately after the call returns -- see _run_loop's
+            # identical comment.
+            self._check_deadline(start_time, max_exec_time)
+
             cb.fire_llm_end(
                 response.text if response.is_final_answer else None,
                 agent=self,
@@ -1594,6 +1640,7 @@ class AgentLoopMixin:
             approved, calls_and_results = self._gate_tool_calls_for_approval(
                 response.tool_calls, approval_callback, cb, logger, iteration
             )
+            self._check_deadline(start_time, max_exec_time)
 
             if approved:
                 max_workers = min(len(approved), getattr(self, "MAX_TOOL_WORKERS", 8))
@@ -1605,6 +1652,7 @@ class AgentLoopMixin:
                     futures = [(tc, pool.submit(self._execute_tool, tool_map, tc.name, tc.arguments)) for tc in approved]
                     for tc, future in futures:
                         result = self._collect_future_result(tc.name, future, tool_timeout)
+                        self._check_deadline(start_time, max_exec_time)
                         cb.fire_tool_end(tc.name, result, agent=self)
                         if logger:
                             logger.tool_result(tc.name, result, iteration)
@@ -1655,13 +1703,28 @@ class AgentLoopMixin:
 
             call_kwargs = {**extra_kwargs, **iteration_extra_kwargs}
             try:
-                response = await self._acall_llm_with_retry(
+                acall = self._acall_llm_with_retry(
                     lambda: self.llm.ainvoke_with_tools(call_messages, self.tools, **call_kwargs)  # type: ignore[attr-defined]
                 )
+                if max_exec_time:
+                    remaining = max_exec_time - (time.monotonic() - start_time)
+                    if remaining <= 0:
+                        raise AgentTimeoutError(max_exec_time)
+                    response = await asyncio.wait_for(acall, timeout=remaining)
+                else:
+                    response = await acall
             except NotImplementedError as exc:
                 raise self._wrap_unsupported_native_error(exc) from exc
+            except AgentTimeoutError:
+                raise
+            except asyncio.TimeoutError:
+                raise AgentTimeoutError(max_exec_time)
             except Exception as exc:
                 raise AgentLLMError(exc) from exc
+
+            # Recheck immediately after the call returns -- see _run_loop's
+            # identical comment.
+            self._check_deadline(start_time, max_exec_time)
 
             await cb.afire_llm_end(
                 response.text if response.is_final_answer else None,
@@ -1694,12 +1757,14 @@ class AgentLoopMixin:
             approved, calls_and_results = await self._gate_tool_calls_for_approval_async(
                 response.tool_calls, approval_callback, cb, logger, iteration
             )
+            self._check_deadline(start_time, max_exec_time)
 
             if approved:
                 results = await asyncio.gather(*[
                     self._execute_tool_async_with_timeout(tool_map, tc.name, tc.arguments, tool_timeout)
                     for tc in approved
                 ])
+                self._check_deadline(start_time, max_exec_time)
                 for tc, result in zip(approved, results):
                     await cb.afire_tool_end(tc.name, result, agent=self)
                     if logger:

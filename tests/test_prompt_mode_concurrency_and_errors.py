@@ -105,9 +105,8 @@ def test_prompt_loop_max_iterations_raises():
 def test_prompt_loop_timeout_raises():
     class SlowLLM:
         """Keeps calling the 'noop' tool (never a final answer) so the loop
-        runs several iterations -- the timeout guard only runs at the top
-        of each iteration, so a single slow call that returns immediately
-        wouldn't get a second chance to trip it."""
+        runs several iterations, tripping the timeout via the top-of-iteration
+        check even without the immediate post-call recheck this covers."""
 
         def invoke(self, prompt, **kwargs):
             time.sleep(0.05)
@@ -125,6 +124,54 @@ def test_prompt_loop_timeout_raises():
 
     with pytest.raises(AgentTimeoutError):
         agent.invoke("go")
+
+
+def test_prompt_loop_single_slow_call_trips_timeout_immediately():
+    """FRAMEWORK_REVIEW.md Finding #1 regression: a single LLM call that
+    overruns max_execution_time used to complete normally when max_iterations
+    == 1 (there's no second iteration for the old top-of-iteration-only check
+    to catch it at), letting a hung call blow the declared deadline by an
+    arbitrary amount. The deadline must now be rechecked immediately after
+    the call returns, not just between iterations."""
+
+    class OverrunningLLM:
+        def invoke(self, prompt, **kwargs):
+            time.sleep(0.06)
+            return json.dumps({"thought": None, "actions": [], "final_answer": "done"})
+
+        async def ainvoke(self, prompt, **kwargs):
+            await asyncio.sleep(0.06)
+            return json.dumps({"thought": None, "actions": [], "final_answer": "done"})
+
+    agent = Agent(llm=OverrunningLLM(), max_iterations=1, max_execution_time=0.01)
+
+    with pytest.raises(AgentTimeoutError):
+        agent.invoke("go")
+
+
+@pytest.mark.asyncio
+async def test_async_prompt_loop_single_slow_call_trips_timeout_immediately():
+    """Async counterpart of the above -- also verifies the slow ainvoke() is
+    actually cancelled at its next await point via asyncio.wait_for, not just
+    detected after it eventually returns."""
+
+    class OverrunningAsyncLLM:
+        def invoke(self, prompt, **kwargs):
+            raise NotImplementedError
+
+        async def ainvoke(self, prompt, **kwargs):
+            await asyncio.sleep(0.5)
+            return json.dumps({"thought": None, "actions": [], "final_answer": "done"})
+
+    agent = Agent(llm=OverrunningAsyncLLM(), max_iterations=1, max_execution_time=0.01)
+
+    start = time.monotonic()
+    with pytest.raises(AgentTimeoutError):
+        await agent.ainvoke("go")
+    elapsed = time.monotonic() - start
+
+    # Cancelled near the 0.01s deadline, not after the full 0.5s sleep.
+    assert elapsed < 0.3
 
 
 def test_prompt_loop_parse_error_raises():

@@ -879,9 +879,13 @@ You can also override `max_iterations` per call:
 result = agent.invoke("Quick question: capital of Japan?", max_iterations=3)
 ```
 
-`max_execution_time` alone can't stop a *single* tool call from hanging forever
-— it's only checked between iterations, not while a tool call is in flight.
-Use `tool_timeout` for that:
+`max_execution_time` is rechecked immediately after every blocking LLM call,
+tool wait, and approval-callback call returns (not just once per iteration),
+and an in-flight async LLM call is actually cancelled at its next await point
+via `asyncio.wait_for`. It still can't force-stop a hanging *synchronous* call
+already in progress — Python has no way to preempt a running sync frame — so
+it detects an overrun as soon as possible rather than truly interrupting one.
+Use `tool_timeout` to bound a single tool call instead:
 
 ```python
 agent = Agent(

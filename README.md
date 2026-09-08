@@ -13,43 +13,12 @@ The agent alternates between **Thought** (reasoning about what to do next) and *
 
 **Fully self-contained** — zero third-party runtime dependencies beyond Python 3.10+ (only `autourgos-core`, itself a zero-dependency stdlib utility library shared across the framework). No forced LLM SDK, no forced vector store, no hidden network calls at import time. Bring your own LLM wrapper.
 
-<table>
-<tr><td width="50%" valign="top">
-
-**🧠 Core loop**
-- Thought → Action → Observation, JSON-driven
-- Native structured tool-calling mode too
-- Parallel tool calls (thread pool / `asyncio.gather`)
-- Async everywhere — every method has an `a`-prefixed twin
-
-</td><td width="50%" valign="top">
-
-**🧩 Built in, zero extra install**
-- Lazy-loaded **toolboxes** for large tool catalogs
-- Per-iteration **file/callback injection** (screenshots, live data)
-- **Run history** to disk, secrets auto-redacted
-- **Pause / resume** an in-flight run from any thread
-- Auto-summarizing scratchpad, retry-with-backoff, timeouts
-
-</td></tr>
-<tr><td width="50%" valign="top">
-
-**🔌 Extensible**
-- `CallbackHandler` middleware — 11 lifecycle hooks
-- Sync or async hooks, mixed freely, from either loop
-- Approval callbacks for human-in-the-loop / safety gates
-- Works with `autourgos-hcix`, `autourgos-skills`, and any
-  hand-written middleware
-
-</td><td width="50%" valign="top">
-
-**🌐 Any LLM**
-- OpenAI, Groq, Together AI, Mistral, DeepSeek, Perplexity
-- Ollama / LM Studio / vLLM — fully local, no API key
-- Anything with `.invoke()` / `.ainvoke()` — no lock-in
-
-</td></tr>
-</table>
+| Area | What you get |
+|---|---|
+| Core loop | Thought → Action → Observation, JSON-driven; native structured tool-calling mode too; parallel tool calls (thread pool / `asyncio.gather`); async everywhere — every method has an `a`-prefixed twin |
+| Built in, zero extra install | Lazy-loaded **toolboxes** for large tool catalogs; per-iteration **file/callback injection** (screenshots, live data); **run history** to disk with secrets auto-redacted; **pause/resume** an in-flight run from any thread; auto-summarizing scratchpad, retry-with-backoff, timeouts |
+| Extensible | `CallbackHandler` middleware with 11 lifecycle hooks; sync or async hooks, mixed freely, from either loop; approval callbacks for human-in-the-loop / safety gates; works with `autourgos-hcix`, `autourgos-skills`, and any hand-written middleware |
+| Any LLM | OpenAI, Groq, Together AI, Mistral, DeepSeek, Perplexity; Ollama / LM Studio / vLLM — fully local, no API key; anything with `.invoke()` / `.ainvoke()` — no lock-in |
 
 ---
 
@@ -85,44 +54,44 @@ This continues until the agent has a final answer or hits the iteration/time lim
 ## Table of Contents
 
 **Getting started**
-- [📦 Install](#install)
-- [🚀 Quick Start](#quick-start)
-- [🧠 How the Agent Loop Works](#how-the-agent-loop-works)
-- [🔧 Defining Tools](#defining-tools)
-- [🌐 Works With Any LLM](#works-with-any-llm)
+- [Install](#install)
+- [Quick Start](#quick-start)
+- [How the Agent Loop Works](#how-the-agent-loop-works)
+- [Defining Tools](#defining-tools)
+- [Works With Any LLM](#works-with-any-llm)
 
 **Running the agent**
-- [⚡ Async Agent](#async-agent)
-- [🧵 Parallel Tool Calls](#parallel-tool-calls)
-- [🎯 Native Tool Calling](#native-tool-calling)
-- [📢 Verbose Mode](#verbose-mode)
-- [💾 Memory](#memory)
-- [🔐 Approval Callback](#approval-callback)
+- [Async Agent](#async-agent)
+- [Parallel Tool Calls](#parallel-tool-calls)
+- [Native Tool Calling](#native-tool-calling)
+- [Verbose Mode](#verbose-mode)
+- [Memory](#memory)
+- [Approval Callback](#approval-callback)
 
 **Extending the agent**
-- [🧩 Middleware / Callbacks](#middleware--callbacks)
+- [Middleware / Callbacks](#middleware--callbacks)
   - [Middleware Integration Contract](#middleware-integration-contract)
-- [▶️ `on_agent_start` Shortcut](#on_agent_start-shortcut)
-- [📚 Toolboxes (Lazy-Loaded Tool Groups)](#toolboxes-lazy-loaded-tool-groups)
-- [📸 Pre-Iteration Files & Callbacks](#pre-iteration-files--callbacks)
-- [📜 Run History](#run-history)
-- [⏸️ Pause & Resume](#pause--resume)
+- [`on_agent_start` Shortcut](#on_agent_start-shortcut)
+- [Toolboxes (Lazy-Loaded Tool Groups)](#toolboxes-lazy-loaded-tool-groups)
+- [Pre-Iteration Files & Callbacks](#pre-iteration-files--callbacks)
+- [Run History](#run-history)
+- [Pause & Resume](#pause--resume)
 
 **Operating it in production**
-- [🧪 Testing](#testing)
-- [🔒 Context Manager](#context-manager)
-- [⏱️ Time and Iteration Limits](#time-and-iteration-limits)
-- [✂️ Scratchpad Size Limits](#scratchpad-size-limits)
+- [Testing](#testing)
+- [Context Manager](#context-manager)
+- [Time and Iteration Limits](#time-and-iteration-limits)
+- [Scratchpad Size Limits](#scratchpad-size-limits)
   - [Auto-Summarizing Scratchpad](#auto-summarizing-scratchpad)
-- [🔁 LLM Call Retries](#llm-call-retries)
-- [📝 Custom System Prompt](#custom-system-prompt)
+- [LLM Call Retries](#llm-call-retries)
+- [Custom System Prompt](#custom-system-prompt)
 
 **Reference**
-- [📋 Constructor Reference](#constructor-reference)
-- [📋 Tool Dict Reference](#tool-dict-reference)
-- [↩️ What the Agent Returns](#what-the-agent-returns)
-- [⚠️ Exceptions](#exceptions)
-- [🕰️ v1 Backward Compatibility](#v1-backward-compatibility)
+- [Constructor Reference](#constructor-reference)
+- [Tool Dict Reference](#tool-dict-reference)
+- [What the Agent Returns](#what-the-agent-returns)
+- [Exceptions](#exceptions)
+- [v1 Backward Compatibility](#v1-backward-compatibility)
 
 ---
 

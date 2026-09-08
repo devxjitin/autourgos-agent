@@ -16,7 +16,7 @@ import json
 import logging
 from typing import Any, Callable, Dict, List, Optional, Union
 
-from autourgos_core import PerAgentRegistry, Toolbox, parse_param_descriptions
+from autourgos_core import PerAgentRegistry, Toolbox, infer_json_schema
 
 from .base import CallbackHandler, _tool_name
 from .runtime import inject_prompt_block, remove_prompt_block
@@ -61,50 +61,11 @@ class StructuredTool:
 
     @staticmethod
     def _infer_schema(func: Callable) -> Dict[str, Any]:
-        sig    = inspect.signature(func)
-        hints  = {}
-        try:
-            hints = func.__annotations__
-        except Exception:
-            pass
-
-        _PY_TO_JSON = {
-            "str": "string", "int": "integer", "float": "number",
-            "bool": "boolean", "list": "array", "dict": "object",
-        }
-
-        properties: Dict[str, Any] = {}
-        required:   List[str]      = []
-
-        param_docs = parse_param_descriptions(inspect.getdoc(func))
-
-        for param_name, param in sig.parameters.items():
-            if param_name in ("self", "return"):
-                continue
-            hint = hints.get(param_name)
-            type_name = "string"
-            if hint is not None:
-                raw = getattr(hint, "__name__", str(hint))
-                if raw in _PY_TO_JSON:
-                    type_name = _PY_TO_JSON[raw]
-                else:
-                    logger.warning(
-                        "StructuredTool: parameter %r of %r has unmapped type "
-                        "annotation %r -- defaulting its JSON schema type to "
-                        "'string'. Supported annotations: %s.",
-                        param_name, getattr(func, "__name__", func), raw,
-                        sorted(_PY_TO_JSON),
-                    )
-
-            properties[param_name] = {"type": type_name, "description": param_docs.get(param_name, "")}
-            if param.default is inspect.Parameter.empty:
-                required.append(param_name)
-
-        return {
-            "type": "object",
-            "properties": properties,
-            "required": required,
-        }
+        # Delegates to autourgos_core.infer_json_schema -- the canonical
+        # inference implementation shared across the framework (handles
+        # Optional/Union unwrapping and stringified annotations, which this
+        # package's own prior standalone implementation did not).
+        return infer_json_schema(func)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self.func(*args, **kwargs)

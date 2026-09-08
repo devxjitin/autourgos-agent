@@ -274,14 +274,33 @@ def _preprocess_image(
         tmp.close()
         img.save(tmp.name, format="JPEG", quality=jpeg_quality, optimize=True)
         evicted: List[str] = []
+        discard_own = False
         with _image_cache_lock:
             stale = _image_cache.get(cache_key)
-            _image_cache[cache_key] = (mtime, tmp.name)
-            _image_cache.move_to_end(cache_key)
+            if stale is not None and stale[0] == mtime:
+                # A concurrent call for the exact same (path, quality, mtime)
+                # already won this cache slot while we were processing
+                # (Image.open/resize/save runs outside this lock, so two
+                # threads can race here) -- use its result instead of
+                # overwriting it, so a caller that already received and
+                # started using the winning path never has it deleted out
+                # from under it. Our own duplicate output is discarded below.
+                winner_path = stale[1]
+                _image_cache.move_to_end(cache_key)
+                discard_own = True
+            else:
+                _image_cache[cache_key] = (mtime, tmp.name)
+                _image_cache.move_to_end(cache_key)
+                winner_path = tmp.name
             while len(_image_cache) > _IMAGE_CACHE_MAX_ENTRIES:
                 _, (_, evicted_path) = _image_cache.popitem(last=False)
                 evicted.append(evicted_path)
-        if stale is not None and stale[1] != tmp.name:
+        if discard_own:
+            try:
+                os.remove(tmp.name)
+            except OSError:
+                pass
+        elif stale is not None and stale[1] != tmp.name:
             try:
                 os.remove(stale[1])
             except OSError:
@@ -291,9 +310,9 @@ def _preprocess_image(
                 os.remove(evicted_path)
             except OSError:
                 pass
-        if created_files is not None:
+        if created_files is not None and not discard_own:
             created_files.append(tmp.name)
-        return tmp.name
+        return winner_path
     except Exception as exc:
         logger.warning(
             f"Image preprocessing failed for {path!r}: {exc}. Using original."

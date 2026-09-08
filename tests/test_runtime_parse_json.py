@@ -7,7 +7,7 @@ Tests for runtime.parse_json_object, focused on:
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from autourgos_agent.runtime import parse_json_object
 

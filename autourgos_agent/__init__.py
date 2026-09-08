@@ -74,7 +74,7 @@ def Create_Agent(*args: object, **kwargs: object) -> Agent:
 
 from autourgos_core import package_version
 
-__version__ = package_version("autourgos-agent", fallback="3.1.5")
+__version__ = package_version("autourgos-agent", fallback="3.9.0")
 
 __all__ = [
     "Agent",

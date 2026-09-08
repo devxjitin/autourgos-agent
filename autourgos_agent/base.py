@@ -14,7 +14,6 @@ import contextvars
 import inspect
 import json
 import logging
-import re
 import threading
 import time
 from abc import ABC, abstractmethod

@@ -20,7 +20,7 @@ import asyncio
 import json
 from typing import Any, Dict, List, Optional
 
-from autourgos_agent import Agent, AgentLogger, CallbackHandler, CallbackManager
+from autourgos_agent import Agent, AgentLogger, CallbackHandler
 
 
 class FakeLLM:

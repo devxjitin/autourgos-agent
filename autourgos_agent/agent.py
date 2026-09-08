@@ -31,7 +31,14 @@ from typing import Any, Callable, Dict, List, Optional
 from autourgos_core import Toolbox
 
 from ._toolbox import ToolboxMiddleware
-from .base import AgentAlreadyRunningError, AgentLoopMixin, BaseAgent, CallbackHandler, MemoryProtocol
+from .base import (
+    AgentAlreadyRunningError,
+    AgentLoopMixin,
+    BaseAgent,
+    CallbackHandler,
+    CallbackManager,
+    MemoryProtocol,
+)
 from .history import _NULL_HISTORY, _HistoryRecorder
 from .logging import AgentLogger
 from .prompt import LOGIC_PROMPT, PREFIX_PROMPT, SUFFIX_PROMPT
@@ -58,7 +65,7 @@ class _FunctionStartHandler(CallbackHandler):
 
     def __init__(self, fn: Callable[..., Any]) -> None:
         self._fn = fn
-        wants_agent = _accepts_agent_kwarg(fn)
+        wants_agent = CallbackManager._accepts_agent_kwarg(fn)
 
         if inspect.iscoroutinefunction(fn):
             async def on_agent_start(query: str, agent: Any = None, **kwargs: Any) -> None:
@@ -77,19 +84,6 @@ class _FunctionStartHandler(CallbackHandler):
         # returns exactly this function -- with the right iscoroutinefunction() answer
         # for THIS fn -- instead of always resolving to one fixed class-level method.
         self.on_agent_start = on_agent_start
-
-
-def _accepts_agent_kwarg(fn: Callable[..., Any]) -> bool:
-    """Whether `fn` can take an `agent=` keyword -- mirrors
-    CallbackManager._accepts_agent_kwarg (kept private there)."""
-    try:
-        sig = inspect.signature(fn)
-    except (TypeError, ValueError):
-        return False
-    for param in sig.parameters.values():
-        if param.kind == inspect.Parameter.VAR_KEYWORD or param.name == "agent":
-            return True
-    return False
 
 
 class Agent(AgentLoopMixin, BaseAgent):

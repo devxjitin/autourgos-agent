@@ -227,19 +227,18 @@ class Agent(AgentLoopMixin, BaseAgent):
         iteration -- take a screenshot, refresh a cache, ping a health
         endpoint, etc. Written directly from the agent loop, not via
         `middleware=` (this only ever applies to the one Agent instance
-        it's configured on). For a callback that needs sharing across
-        multiple concurrent agents, use `PreIterationMiddleware` via
-        `middleware=` instead.
+        it's configured on).
     pre_iteration_files : str, list of str, or callable(iteration), optional
         File path(s) to inject into the LLM at every iteration. Pass a
         callable to generate paths dynamically (e.g. a screenshot that
         changes every iteration).
     image_quality : str or int
         Controls screenshot token cost when `pre_iteration_files` resolves
-        to an image -- see `PreIterationMiddleware`'s identical parameter
-        for the full option list (``"auto"`` default, ``"low"``,
-        ``"medium"``, ``"high"``, or an int 1-100 JPEG quality). Ignored
-        when `pre_iteration_files` is not set.
+        to an image: ``"auto"`` (default, no change), ``"high"`` (no
+        resize, forces `detail="high"`), ``"medium"`` (downscale to
+        <=768px, JPEG q70), ``"low"`` (downscale to <=512px, JPEG q60), or
+        an ``int`` 1-100 (JPEG quality directly). Ignored when
+        `pre_iteration_files` is not set.
     """
 
     MAX_CONSECUTIVE_PARSE_ERRORS: int = 3
@@ -334,10 +333,10 @@ class Agent(AgentLoopMixin, BaseAgent):
             self.add_middleware(ToolboxMiddleware(toolboxes=toolbox))
         self._history = _HistoryRecorder(folder=history) if history else _NULL_HISTORY
         # Inline (non-middleware) pre-iteration file/callback injection --
-        # see _preiteration._PreIterationRuntime's docstring for why this
-        # doesn't go through the CallbackHandler/middleware bus the way
-        # PreIterationMiddleware (still available for explicit
-        # multi-agent-sharing use) does.
+        # native features of this package are plain constructor kwargs,
+        # not middleware; the CallbackHandler/middleware bus is reserved
+        # for third-party extensions (autourgos-hcix, autourgos-skills,
+        # your own code).
         self._preiteration = (
             _PreIterationRuntime(pre_iteration_callback, pre_iteration_files, image_quality)
             if (pre_iteration_callback is not None or pre_iteration_files is not None)

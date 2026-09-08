@@ -10,7 +10,7 @@ import pytest
 
 from autourgos_agent import _preiteration
 from autourgos_agent._preiteration import (
-    PreIterationMiddleware,
+    _PreIterationRuntime,
     _image_cache,
     _preprocess_image,
 )
@@ -121,40 +121,37 @@ def test_preprocess_image_is_thread_safe_under_concurrent_calls(tmp_path):
     assert os.path.exists(results[0])
 
 
-def test_preiteration_middleware_cleanup_preserves_still_cached_file(tmp_path):
+def test_preiteration_runtime_cleanup_preserves_still_cached_file(tmp_path):
     """A temp file this run created but that's still live in the shared
-    cache must survive on_agent_end's cleanup -- only files evicted or
-    superseded should actually be removed (see get_injection_kwargs'
-    cache-sharing docstring)."""
+    cache must survive cleanup() -- only files evicted or superseded
+    should actually be removed."""
     src = _make_png(str(tmp_path))
-    middleware = PreIterationMiddleware(files=src, image_quality="low")
+    runtime = _PreIterationRuntime(callback=None, files=src, image_quality="low")
 
-    middleware.on_iteration_start(1, agent=None)
-    injected = middleware.get_injection_kwargs()
+    injected = runtime.before_iteration(1, agent=None)
     processed_path = injected["files"][0]
     assert os.path.exists(processed_path)
 
-    middleware.on_agent_end("done", agent=None)
+    runtime.cleanup()
 
     # Still referenced by the shared _image_cache -- not deleted.
     assert os.path.exists(processed_path)
 
 
-def test_preiteration_middleware_cleanup_removes_evicted_temp_file(tmp_path, monkeypatch):
+def test_preiteration_runtime_cleanup_removes_evicted_temp_file(tmp_path):
     """Once a run's temp file is no longer the live cache entry (e.g. the
     source changed and a new one superseded it), cleanup must actually
     remove it instead of leaking it forever."""
     src = _make_png(str(tmp_path))
-    middleware = PreIterationMiddleware(files=src, image_quality="low")
+    runtime = _PreIterationRuntime(callback=None, files=src, image_quality="low")
 
-    middleware.on_iteration_start(1, agent=None)
-    injected = middleware.get_injection_kwargs()
+    injected = runtime.before_iteration(1, agent=None)
     processed_path = injected["files"][0]
 
     # Simulate the cache entry being superseded by something else entirely
     # (e.g. a different quality run, or eviction) before this run ends.
     _image_cache.clear()
 
-    middleware.on_agent_error(Exception("boom"), agent=None)
+    runtime.cleanup()
 
     assert not os.path.exists(processed_path)

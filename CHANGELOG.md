@@ -1,5 +1,10 @@
 # Changelog
 
+## [3.10.0] - 2026-09-08
+
+- **Added:** `Agent(pre_iteration_callback=..., pre_iteration_files=..., image_quality=...)` -- run a callback and/or inject files (e.g. a fresh screenshot) before every iteration, built directly into the agent loop rather than via `middleware=`. Matches the `history=`/`summarize_every=` pattern: this only ever applies to the one `Agent` instance it's configured on, so it needs none of a middleware's cross-instance-sharing machinery. The async path offloads to a worker thread (`run_in_executor`) so a slow callback/image-preprocess never blocks the event loop. See README's [Pre-Iteration Files & Callbacks](README.md#pre-iteration-files--callbacks).
+- **Removed:** `PreIterationMiddleware` (added when this package absorbed the retired standalone `autourgos-preiteration` package). Superseded entirely by the inline kwargs above -- built-in features of this package are plain constructor kwargs, not middleware; the `CallbackHandler`/`middleware=` bus is reserved for third-party extensions (`autourgos-hcix`, `autourgos-skills`, your own code). **Breaking change** for anyone using `from autourgos_agent import PreIterationMiddleware` / `middleware=[PreIterationMiddleware(...)]` -- switch to `Agent(pre_iteration_callback=..., pre_iteration_files=..., image_quality=...)`. `SEQUENTIAL`/`PARALLEL` (for combining multiple callbacks) are unaffected and now used directly with `pre_iteration_callback=`.
+
 ## [3.7.0] - 2026-09-08
 
 - **Added:** `Agent(history=<folder>)` -- inbuilt run history recording, replacing the separate `autourgos-history` package/middleware (now removed). When set, every run is written directly to a Markdown + JSON file pair under that folder (thoughts, tool calls, observations, final answer), with secret-shaped values (API keys, bearer tokens, JWTs, ...) redacted before writing. Implemented as a direct call from the agent loop (`autourgos_agent/history.py`'s `_HistoryRecorder`), not as a `CallbackHandler`/`middleware=` entry -- no extra package or wiring required. `None` (default) disables it entirely with zero overhead (`_NullHistory` no-op).

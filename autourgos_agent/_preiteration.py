@@ -1,7 +1,8 @@
 """
-_preiteration.py -- SEQUENTIAL, PARALLEL, and PreIterationMiddleware.
+_preiteration.py -- SEQUENTIAL, PARALLEL, and the inline pre-iteration runtime.
 
-Ported from the (now retired) standalone autourgos-preiteration package.
+Ported from the (now retired) standalone autourgos-preiteration package,
+then folded into the agent loop itself (see _PreIterationRuntime below).
 Run callbacks and inject files (screenshots, docs) before each agent
 iteration -- sync and async hooks, sequential and parallel execution, and
 automatic image compression to reduce LLM token costs.
@@ -18,22 +19,18 @@ import tempfile
 import threading
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Union
 
-from autourgos_core import RunScopedState
-
-from .base import CallbackHandler
-
-__all__ = ["PreIterationMiddleware", "SEQUENTIAL", "PARALLEL", "is_async_callable"]
+__all__ = ["SEQUENTIAL", "PARALLEL", "is_async_callable"]
 
 # _NullPreIteration/_PreIterationRuntime (bottom of this file) are internal
 # -- Agent(pre_iteration_callback=..., pre_iteration_files=...) builds one
 # directly, the same way Agent(history=...)/Agent(summarize_every=...)
 # build _HistoryRecorder/their inline summarizer state instead of going
-# through the CallbackHandler/middleware bus. PreIterationMiddleware below
-# is unchanged and still the right choice when one instance needs to be
-# shared across multiple concurrent agents (it uses RunScopedState for
-# exactly that); the inline runtime below deliberately does NOT support
-# that (flat instance state), since Agent's own _run_lock already
-# guarantees only one run is ever active per Agent instance at a time.
+# through the CallbackHandler/middleware bus. Features native to this
+# package (pre-iteration injection, history, summarization) are plain
+# Agent() constructor kwargs, not middleware -- the middleware bus
+# (CallbackHandler/middleware=[...]) is reserved for third-party
+# extensions (autourgos-hcix, autourgos-skills, your own code), not for
+# this package's own built-in features.
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -43,12 +40,12 @@ def _run_coroutine_sync(coro: Any) -> Any:
     Run a coroutine to completion from synchronous code, safe whether or
     not the calling thread already has a running event loop.
 
-    ``on_iteration_start`` is a sync CallbackHandler hook, but
-    ``agent.ainvoke()`` calls it directly from the event-loop thread (not
-    via a separate thread), so ``asyncio.get_running_loop()`` succeeding
-    here means the loop IS the current thread. Running the coroutine on an
-    isolated thread with its own fresh loop sidesteps deadlocking that
-    thread against its own loop.
+    ``_PreIterationRuntime.before_iteration`` is a plain sync method, but
+    it can end up called on a thread that already has a running loop (a
+    caller invoking it directly instead of through
+    ``abefore_iteration``'s worker-thread offload). Running the coroutine
+    on an isolated thread with its own fresh loop sidesteps deadlocking
+    that thread against its own loop in that case.
     """
     try:
         asyncio.get_running_loop()
@@ -96,7 +93,7 @@ class SEQUENTIAL:
     -------
     ::
 
-        from autourgos_agent import SEQUENTIAL, PreIterationMiddleware
+        from autourgos_agent import Agent, SEQUENTIAL
 
         def capture_screen(iteration: int) -> None:
             take_screenshot(f"step_{iteration}.png")
@@ -104,8 +101,9 @@ class SEQUENTIAL:
         def log_step(iteration: int) -> None:
             print(f"Iteration {iteration} starting")
 
-        middleware = PreIterationMiddleware(
-            callback=SEQUENTIAL[capture_screen, log_step]
+        agent = Agent(
+            llm=my_llm,
+            pre_iteration_callback=SEQUENTIAL[capture_screen, log_step],
         )
     """
 
@@ -149,10 +147,11 @@ class PARALLEL:
     -------
     ::
 
-        from autourgos_agent import PARALLEL, PreIterationMiddleware
+        from autourgos_agent import Agent, PARALLEL
 
-        middleware = PreIterationMiddleware(
-            callback=PARALLEL[capture_screen, refresh_cache, ping_health_check]
+        agent = Agent(
+            llm=my_llm,
+            pre_iteration_callback=PARALLEL[capture_screen, refresh_cache, ping_health_check],
         )
     """
 
@@ -331,170 +330,6 @@ def _preprocess_image(
         return path
 
 
-# ── PreIterationMiddleware ────────────────────────────────────────────────
-
-class PreIterationMiddleware(CallbackHandler):
-    """
-    Middleware that executes a callback and/or injects files before each
-    agent iteration.
-
-    Use this to:
-
-    * Take a screenshot before every iteration and feed it to the LLM.
-    * Refresh a live data feed, clear a cache, or ping a health endpoint.
-    * Run any custom logic (sync or async) at the start of each loop.
-
-    Parameters
-    ----------
-    callback : callable, optional
-        Sync or async ``callable(iteration: int)``. Wrap multiple callables
-        with :class:`SEQUENTIAL` or :class:`PARALLEL`.
-    files : str, list of str, or callable(iteration) -> str | list, optional
-        File path(s) to inject into the LLM at every iteration. Pass a
-        callable to generate paths dynamically (e.g. a screenshot that
-        changes every iteration).
-    image_quality : str or int
-        Controls screenshot token cost. Options:
-
-        * ``"auto"`` (default) — no change, backward-compatible.
-        * ``"high"`` — forces ``detail="high"``, no resize.
-        * ``"medium"`` — downscales to ≤768 px, JPEG q70, ``detail="auto"``.
-        * ``"low"`` — downscales to ≤512 px, JPEG q60, ``detail="low"`` (~85 tokens flat).
-        * ``int`` 1–100 — JPEG quality; ``detail="low"`` when ≤512 else ``"auto"``.
-
-        Pillow is required for resize: ``pip install 'autourgos-agent[images]'``.
-
-    Example
-    -------
-    ::
-
-        from autourgos_agent import Agent, PreIterationMiddleware
-
-        SCREENSHOT = "/tmp/screen.png"
-
-        def capture(iteration: int) -> None:
-            take_screenshot(SCREENSHOT)
-
-        middleware = PreIterationMiddleware(
-            callback=capture,
-            files=SCREENSHOT,
-            image_quality="low",
-        )
-        agent = Agent(llm=my_llm, middleware=[middleware])
-    """
-
-    def __init__(
-        self,
-        callback: Optional[Callable[[int], Union[None, Awaitable[None]]]] = None,
-        files: Optional[
-            Union[str, List[str], Callable[[int], Optional[Union[str, List[str]]]]]
-        ] = None,
-        image_quality: Union[str, int] = "auto",
-    ) -> None:
-        if isinstance(image_quality, int):
-            if not (1 <= image_quality <= 100):
-                raise ValueError("image_quality as int must be between 1 and 100.")
-        elif str(image_quality).lower() not in _IMAGE_QUALITY_TIERS:
-            raise ValueError(
-                f"image_quality must be one of {list(_IMAGE_QUALITY_TIERS)} or int 1-100, "
-                f"got {image_quality!r}."
-            )
-        self.callback      = callback
-        self._files        = files
-        self.image_quality = image_quality
-        # Run-scoped (contextvars-backed), not a flat instance attribute --
-        # see RunScopedState: a flat attribute would let two concurrent runs
-        # sharing this one middleware instance clobber each other's state.
-        self._current_kwargs: "RunScopedState[Dict[str, Any]]" = RunScopedState(default_factory=dict)
-        self.logger = logging.getLogger(__name__)
-        self._created_temp_files: "RunScopedState[List[str]]" = RunScopedState(default_factory=list)
-
-    def on_iteration_start(self, iteration: int, agent: Any = None, **kwargs: Any) -> None:
-        if self.callback:
-            try:
-                res = self.callback(iteration)
-                if inspect.iscoroutine(res):
-                    _run_coroutine_sync(res)
-            except Exception as exc:
-                self.logger.error(
-                    f"Error in pre-iteration callback at iteration {iteration}: {exc}"
-                )
-
-        current_kwargs = self._current_kwargs.reset()
-        if self._files is not None:
-            resolved = self._files(iteration) if callable(self._files) else self._files
-            if resolved:
-                raw: List[str] = []
-                if isinstance(resolved, list):
-                    raw = [f for f in resolved if f and os.path.exists(f)]
-                elif isinstance(resolved, str) and os.path.exists(resolved):
-                    raw = [resolved]
-
-                if raw:
-                    processed = [
-                        _preprocess_image(
-                            f, self.image_quality, self.logger,
-                            created_files=self._created_temp_files.get(),
-                        )
-                        if _is_image(f) else f
-                        for f in raw
-                    ]
-                    current_kwargs["files"] = processed
-                    detail = _detail_for(self.image_quality)
-                    if detail is not None:
-                        current_kwargs["image_detail"] = detail
-
-                    narrate_logger = getattr(agent, "logger", None)
-                    if narrate_logger:
-                        narrate_logger.middleware(
-                            "PreIteration",
-                            f"Injected {len(processed)} file(s) before iteration {iteration}.",
-                        )
-
-    def get_injection_kwargs(self) -> Dict[str, Any]:
-        """Return file-injection kwargs to pass to the LLM call."""
-        return dict(self._current_kwargs.get())
-
-    def on_before_iteration(self, iteration: int, agent: Any = None, **kwargs: Any) -> Optional[Dict[str, Any]]:
-        """
-        Fired right before the LLM is invoked for this iteration. Returns
-        whatever files/image_detail kwargs were already resolved for this
-        iteration by on_iteration_start (which the loop calls first), so
-        they get merged into that iteration's llm.invoke()/ainvoke() call.
-        """
-        injection = self.get_injection_kwargs()
-        return injection or None
-
-    def _cleanup_temp_files(self) -> None:
-        """
-        Remove temp files created during this run by ``_preprocess_image``,
-        skipping any file still referenced by the shared ``_image_cache``
-        (so a later run with the same unchanged image can still hit the
-        cache and reuse it without reprocessing).
-        """
-        created_temp_files = self._created_temp_files.get()
-        if not created_temp_files:
-            return
-        with _image_cache_lock:
-            live_cached_paths = {v[1] for v in _image_cache.values()}
-        for tmp_path in created_temp_files:
-            if tmp_path in live_cached_paths:
-                continue
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                self.logger.debug(
-                    "Could not remove temp file %r during cleanup", tmp_path, exc_info=True,
-                )
-        self._created_temp_files.reset()
-
-    def on_agent_end(self, response: str, agent: Any = None, **kwargs: Any) -> None:
-        self._cleanup_temp_files()
-
-    def on_agent_error(self, error: Exception, agent: Any = None, **kwargs: Any) -> None:
-        self._cleanup_temp_files()
-
-
 # ── inline runtime (Agent(pre_iteration_callback=..., pre_iteration_files=...)) ──
 
 class _NullPreIteration:
@@ -520,11 +355,9 @@ class _PreIterationRuntime:
     directly by Agent(pre_iteration_callback=..., pre_iteration_files=...,
     image_quality=...) -- mirrors AgentLoopMixin's _maybe_summarize/
     _history pattern: this only ever applies to the ONE Agent instance it's
-    configured on, so it needs none of PreIterationMiddleware's
-    RunScopedState cross-instance-sharing machinery (flat instance state is
-    safe since Agent's own _run_lock guarantees only one run is ever active
-    per instance at a time). PreIterationMiddleware itself is untouched and
-    still the right choice for the deliberately-shared-across-agents case.
+    configured on, so it needs no cross-instance-sharing machinery -- flat
+    instance state is safe since Agent's own _run_lock guarantees only one
+    run is ever active per instance at a time.
     """
 
     def __init__(
@@ -602,8 +435,9 @@ class _PreIterationRuntime:
 
     def cleanup(self) -> None:
         """Remove temp files created during this run, skipping any file
-        still referenced by the shared _image_cache -- see
-        PreIterationMiddleware._cleanup_temp_files' identical docstring."""
+        still referenced by the shared _image_cache (so a later run with
+        the same unchanged image can still hit the cache and reuse it
+        without reprocessing)."""
         if not self._created_temp_files:
             return
         with _image_cache_lock:

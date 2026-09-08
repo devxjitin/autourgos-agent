@@ -37,7 +37,7 @@ from autourgos_core import Toolbox
 
 from .agent   import Agent
 from ._toolbox import ToolboxMiddleware
-from ._preiteration import PARALLEL, SEQUENTIAL, PreIterationMiddleware, is_async_callable
+from ._preiteration import PARALLEL, SEQUENTIAL, is_async_callable
 from .base    import (
     BaseLLM,
     BaseAgent,
@@ -74,7 +74,7 @@ def Create_Agent(*args: object, **kwargs: object) -> Agent:
 
 from autourgos_core import package_version
 
-__version__ = package_version("autourgos-agent", fallback="3.9.0")
+__version__ = package_version("autourgos-agent", fallback="3.10.0")
 
 __all__ = [
     "Agent",
@@ -106,8 +106,7 @@ __all__ = [
     # native toolbox support (Agent(toolbox=[...]))
     "Toolbox",
     "ToolboxMiddleware",
-    # pre-iteration middleware
-    "PreIterationMiddleware",
+    # pre-iteration callback/file hooks (Agent(pre_iteration_callback=..., pre_iteration_files=...))
     "SEQUENTIAL",
     "PARALLEL",
     "is_async_callable",

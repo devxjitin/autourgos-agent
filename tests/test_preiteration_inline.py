@@ -1,9 +1,9 @@
 """
 Coverage for Agent(pre_iteration_callback=..., pre_iteration_files=...) --
-the inline (non-middleware) replacement for manually wiring
-PreIterationMiddleware via middleware=[...]. See _preiteration.py's
-_PreIterationRuntime docstring for why this exists as a separate,
-flat-state path instead of going through the CallbackHandler bus.
+the built-in, non-middleware way to run a callback and/or inject files
+before every iteration. See _preiteration.py's _PreIterationRuntime
+docstring for why this is plain instance state instead of going through
+the CallbackHandler/middleware bus.
 """
 import json
 import os

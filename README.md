@@ -744,10 +744,10 @@ this same pattern to narrate their own actions.
 
 ### Middleware Integration Contract
 
-These are the three pieces of surface area sibling middleware (the built-in
-`ToolboxMiddleware`, `PreIterationMiddleware`, `autourgos-hcix`,
-`autourgos-skills`, and anything else you write) can rely on. This is the
-official, stable contract — treat it as public API.
+These are the three pieces of surface area sibling middleware (the
+built-in `ToolboxMiddleware`, `autourgos-hcix`, `autourgos-skills`, and
+anything else you write) can rely on. This is the official, stable
+contract — treat it as public API.
 
 **`agent.scratchpad` (str)**
 A real, live instance attribute, not just a local loop variable. It is
@@ -945,15 +945,10 @@ Run a callback and/or inject files (e.g. a fresh screenshot) before every
 agent iteration — useful for computer-use / vision agents, live data feeds,
 or anything that needs to refresh before each step.
 
-There are **two ways** to wire this up. Use `pre_iteration_callback=`/
-`pre_iteration_files=` on `Agent()` unless you specifically need one
-instance shared across multiple concurrent agents — see the comparison
-below.
-
-### Recommended: `Agent(pre_iteration_callback=..., pre_iteration_files=...)`
-
-Built directly into the agent loop (not middleware) — same pattern as
-`history=`/`summarize_every=`. Zero wiring, zero overhead when unset:
+Built directly into the agent loop via `pre_iteration_callback=`/
+`pre_iteration_files=` on `Agent()` — same pattern as `history=`/
+`summarize_every=`. Not middleware: no `CallbackHandler` to write, no
+`middleware=[...]` to wire up, zero overhead when unset.
 
 ```python
 from autourgos_agent import Agent
@@ -996,31 +991,9 @@ The callback can be sync or async, and runs safely from both `invoke()`
 blocks the event loop). A callback that raises is logged (at `ERROR`) and
 does not stop the agent run.
 
-### Advanced: `PreIterationMiddleware` (shared across multiple agents)
-
-Same behavior, but as an explicit `CallbackHandler` you construct yourself
-and pass via `middleware=` — the right choice **only** when one instance
-genuinely needs to be shared across several concurrently-running agents
-(it tracks per-agent state internally so runs never clash):
-
-```python
-from autourgos_agent import Agent, PreIterationMiddleware
-from autourgos_openaichat import OpenAIChatModel
-
-middleware = PreIterationMiddleware(
-    callback=capture,
-    files=SCREENSHOT,
-    image_quality="low",
-)
-
-agent_a = Agent(llm=OpenAIChatModel(model="gpt-4o"), middleware=[middleware])
-agent_b = Agent(llm=OpenAIChatModel(model="gpt-4o"), middleware=[middleware])
-# both agents safely share the same middleware instance and its temp-file cache
-```
-
 Run multiple callbacks with `SEQUENTIAL` (one after another) or `PARALLEL`
 (concurrently — sync callbacks in a thread pool, async ones as asyncio
-tasks) — works with either wiring style above:
+tasks):
 
 ```python
 from autourgos_agent import SEQUENTIAL, PARALLEL

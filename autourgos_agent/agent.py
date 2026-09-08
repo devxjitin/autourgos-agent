@@ -26,10 +26,11 @@ from __future__ import annotations
 
 import inspect
 import threading
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from autourgos_core import Toolbox
 
+from ._preiteration import _NULL_PREITERATION, _PreIterationRuntime
 from ._toolbox import ToolboxMiddleware
 from .base import (
     AgentAlreadyRunningError,
@@ -221,6 +222,24 @@ class Agent(AgentLoopMixin, BaseAgent):
                 def on_agent_start(self, query, agent=None, **kw):
                     fn(query)
             agent.add_middleware(_Start())
+    pre_iteration_callback : callable, optional
+        Sync or async ``callable(iteration: int)`` run before every
+        iteration -- take a screenshot, refresh a cache, ping a health
+        endpoint, etc. Written directly from the agent loop, not via
+        `middleware=` (this only ever applies to the one Agent instance
+        it's configured on). For a callback that needs sharing across
+        multiple concurrent agents, use `PreIterationMiddleware` via
+        `middleware=` instead.
+    pre_iteration_files : str, list of str, or callable(iteration), optional
+        File path(s) to inject into the LLM at every iteration. Pass a
+        callable to generate paths dynamically (e.g. a screenshot that
+        changes every iteration).
+    image_quality : str or int
+        Controls screenshot token cost when `pre_iteration_files` resolves
+        to an image -- see `PreIterationMiddleware`'s identical parameter
+        for the full option list (``"auto"`` default, ``"low"``,
+        ``"medium"``, ``"high"``, or an int 1-100 JPEG quality). Ignored
+        when `pre_iteration_files` is not set.
     """
 
     MAX_CONSECUTIVE_PARSE_ERRORS: int = 3
@@ -257,6 +276,9 @@ class Agent(AgentLoopMixin, BaseAgent):
         max_tool_workers: Optional[int] = None,
         on_agent_start: Optional[Callable[..., Any]] = None,
         history: Optional[str] = None,
+        pre_iteration_callback: Optional[Callable[[int], Any]] = None,
+        pre_iteration_files: Optional[Union[str, List[str], Callable[[int], Any]]] = None,
+        image_quality: Union[str, int] = "auto",
     ) -> None:
         if tool_calling_mode not in ("prompt", "native"):
             raise ValueError(
@@ -311,6 +333,16 @@ class Agent(AgentLoopMixin, BaseAgent):
         if toolbox:
             self.add_middleware(ToolboxMiddleware(toolboxes=toolbox))
         self._history = _HistoryRecorder(folder=history) if history else _NULL_HISTORY
+        # Inline (non-middleware) pre-iteration file/callback injection --
+        # see _preiteration._PreIterationRuntime's docstring for why this
+        # doesn't go through the CallbackHandler/middleware bus the way
+        # PreIterationMiddleware (still available for explicit
+        # multi-agent-sharing use) does.
+        self._preiteration = (
+            _PreIterationRuntime(pre_iteration_callback, pre_iteration_files, image_quality)
+            if (pre_iteration_callback is not None or pre_iteration_files is not None)
+            else _NULL_PREITERATION
+        )
 
     # ── response parser ────────────────────────────────────────────────────────
 
@@ -410,6 +442,7 @@ class Agent(AgentLoopMixin, BaseAgent):
             # `raise` re-propagates it completely unchanged.
             self.callback_manager.fire_agent_error(exc, agent=self)
             self._history.fail(exc)
+            self._preiteration.cleanup()
             raise
         finally:
             with self._run_lock:
@@ -479,6 +512,7 @@ class Agent(AgentLoopMixin, BaseAgent):
             # Bare `raise` re-propagates cancellation completely unchanged.
             await self.callback_manager.afire_agent_error(exc, agent=self)
             self._history.fail(exc)
+            self._preiteration.cleanup()
             raise
         finally:
             with self._run_lock:

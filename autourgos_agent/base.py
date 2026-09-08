@@ -1446,7 +1446,10 @@ class AgentLoopMixin:
             self._history.begin_iteration(iteration)
             self._maybe_pause(iteration, cb)
             self._maybe_summarize(iteration)
+            preiteration_kwargs = self._preiteration.before_iteration(iteration, agent=self)
             iteration_extra_kwargs = cb.fire_before_iteration(iteration, agent=self)
+            if preiteration_kwargs:
+                iteration_extra_kwargs = {**preiteration_kwargs, **iteration_extra_kwargs}
 
             # time guard
             if max_exec_time and self._elapsed_excluding_pauses(start_time) > max_exec_time:
@@ -1512,6 +1515,7 @@ class AgentLoopMixin:
                     _record_agent_message(memory, final_answer)
                 cb.fire_agent_end(final_answer, agent=self)
                 self._history.finish(final_answer)
+                self._preiteration.cleanup()
                 if logger:
                     logger.final_answer(final_answer)
                 return final_answer
@@ -1667,7 +1671,10 @@ class AgentLoopMixin:
             self._history.begin_iteration(iteration)
             await self._amaybe_pause(iteration, cb)
             await self._amaybe_summarize(iteration)
+            preiteration_kwargs = await self._preiteration.abefore_iteration(iteration, agent=self)
             iteration_extra_kwargs = await cb.afire_before_iteration(iteration, agent=self)
+            if preiteration_kwargs:
+                iteration_extra_kwargs = {**preiteration_kwargs, **iteration_extra_kwargs}
 
             if max_exec_time and self._elapsed_excluding_pauses(start_time) > max_exec_time:
                 raise AgentTimeoutError(max_exec_time)
@@ -1733,6 +1740,7 @@ class AgentLoopMixin:
                     _record_agent_message(memory, final_answer)
                 await cb.afire_agent_end(final_answer, agent=self)
                 self._history.finish(final_answer)
+                self._preiteration.cleanup()
                 if logger:
                     logger.final_answer(final_answer)
                 return final_answer
@@ -2062,7 +2070,10 @@ class AgentLoopMixin:
             self._history.begin_iteration(iteration)
             self._maybe_pause(iteration, cb)
             self._maybe_summarize(iteration)
+            preiteration_kwargs = self._preiteration.before_iteration(iteration, agent=self)
             iteration_extra_kwargs = cb.fire_before_iteration(iteration, agent=self)
+            if preiteration_kwargs:
+                iteration_extra_kwargs = {**preiteration_kwargs, **iteration_extra_kwargs}
 
             if max_exec_time and self._elapsed_excluding_pauses(start_time) > max_exec_time:
                 raise AgentTimeoutError(max_exec_time)
@@ -2110,6 +2121,7 @@ class AgentLoopMixin:
                     _record_agent_message(memory, final_answer)
                 cb.fire_agent_end(final_answer, agent=self)
                 self._history.finish(final_answer)
+                self._preiteration.cleanup()
                 if logger:
                     logger.final_answer(final_answer)
                 return final_answer
@@ -2184,7 +2196,10 @@ class AgentLoopMixin:
             self._history.begin_iteration(iteration)
             await self._amaybe_pause(iteration, cb)
             await self._amaybe_summarize(iteration)
+            preiteration_kwargs = await self._preiteration.abefore_iteration(iteration, agent=self)
             iteration_extra_kwargs = await cb.afire_before_iteration(iteration, agent=self)
+            if preiteration_kwargs:
+                iteration_extra_kwargs = {**preiteration_kwargs, **iteration_extra_kwargs}
 
             if max_exec_time and self._elapsed_excluding_pauses(start_time) > max_exec_time:
                 raise AgentTimeoutError(max_exec_time)
@@ -2238,6 +2253,7 @@ class AgentLoopMixin:
                     _record_agent_message(memory, final_answer)
                 await cb.afire_agent_end(final_answer, agent=self)
                 self._history.finish(final_answer)
+                self._preiteration.cleanup()
                 if logger:
                     logger.final_answer(final_answer)
                 return final_answer

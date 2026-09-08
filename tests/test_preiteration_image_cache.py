@@ -3,7 +3,6 @@ Coverage for autourgos_agent._preiteration's image-cache LRU/eviction and
 thread safety -- previously zero test coverage (autourgos-audit-report.md).
 """
 import os
-import tempfile
 import threading
 import time
 

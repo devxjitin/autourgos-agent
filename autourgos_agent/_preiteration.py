@@ -24,6 +24,17 @@ from .base import CallbackHandler
 
 __all__ = ["PreIterationMiddleware", "SEQUENTIAL", "PARALLEL", "is_async_callable"]
 
+# _NullPreIteration/_PreIterationRuntime (bottom of this file) are internal
+# -- Agent(pre_iteration_callback=..., pre_iteration_files=...) builds one
+# directly, the same way Agent(history=...)/Agent(summarize_every=...)
+# build _HistoryRecorder/their inline summarizer state instead of going
+# through the CallbackHandler/middleware bus. PreIterationMiddleware below
+# is unchanged and still the right choice when one instance needs to be
+# shared across multiple concurrent agents (it uses RunScopedState for
+# exactly that); the inline runtime below deliberately does NOT support
+# that (flat instance state), since Agent's own _run_lock already
+# guarantees only one run is ever active per Agent instance at a time.
+
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -482,3 +493,128 @@ class PreIterationMiddleware(CallbackHandler):
 
     def on_agent_error(self, error: Exception, agent: Any = None, **kwargs: Any) -> None:
         self._cleanup_temp_files()
+
+
+# ── inline runtime (Agent(pre_iteration_callback=..., pre_iteration_files=...)) ──
+
+class _NullPreIteration:
+    """No-op stand-in used when Agent() is built without pre_iteration_callback=/
+    pre_iteration_files= -- every call is a cheap no-op, zero overhead."""
+
+    def before_iteration(self, iteration: int, agent: Any = None) -> Optional[Dict[str, Any]]:
+        return None
+
+    async def abefore_iteration(self, iteration: int, agent: Any = None) -> Optional[Dict[str, Any]]:
+        return None
+
+    def cleanup(self) -> None:
+        pass
+
+
+_NULL_PREITERATION = _NullPreIteration()
+
+
+class _PreIterationRuntime:
+    """
+    Inline (non-middleware) per-iteration callback/file injection, built
+    directly by Agent(pre_iteration_callback=..., pre_iteration_files=...,
+    image_quality=...) -- mirrors AgentLoopMixin's _maybe_summarize/
+    _history pattern: this only ever applies to the ONE Agent instance it's
+    configured on, so it needs none of PreIterationMiddleware's
+    RunScopedState cross-instance-sharing machinery (flat instance state is
+    safe since Agent's own _run_lock guarantees only one run is ever active
+    per instance at a time). PreIterationMiddleware itself is untouched and
+    still the right choice for the deliberately-shared-across-agents case.
+    """
+
+    def __init__(
+        self,
+        callback: Optional[Callable[[int], Union[None, Awaitable[None]]]],
+        files: Optional[
+            Union[str, List[str], Callable[[int], Optional[Union[str, List[str]]]]]
+        ],
+        image_quality: Union[str, int],
+    ) -> None:
+        if isinstance(image_quality, int):
+            if not (1 <= image_quality <= 100):
+                raise ValueError("image_quality as int must be between 1 and 100.")
+        elif str(image_quality).lower() not in _IMAGE_QUALITY_TIERS:
+            raise ValueError(
+                f"image_quality must be one of {list(_IMAGE_QUALITY_TIERS)} or int 1-100, "
+                f"got {image_quality!r}."
+            )
+        self.callback = callback
+        self._files = files
+        self.image_quality = image_quality
+        self.logger = logging.getLogger(__name__)
+        self._created_temp_files: List[str] = []
+
+    def before_iteration(self, iteration: int, agent: Any = None) -> Optional[Dict[str, Any]]:
+        if self.callback:
+            try:
+                res = self.callback(iteration)
+                if inspect.iscoroutine(res):
+                    _run_coroutine_sync(res)
+            except Exception as exc:
+                self.logger.error(
+                    f"Error in pre-iteration callback at iteration {iteration}: {exc}"
+                )
+
+        if self._files is None:
+            return None
+        resolved = self._files(iteration) if callable(self._files) else self._files
+        if not resolved:
+            return None
+
+        raw: List[str] = []
+        if isinstance(resolved, list):
+            raw = [f for f in resolved if f and os.path.exists(f)]
+        elif isinstance(resolved, str) and os.path.exists(resolved):
+            raw = [resolved]
+        if not raw:
+            return None
+
+        processed = [
+            _preprocess_image(
+                f, self.image_quality, self.logger, created_files=self._created_temp_files,
+            )
+            if _is_image(f) else f
+            for f in raw
+        ]
+        result: Dict[str, Any] = {"files": processed}
+        detail = _detail_for(self.image_quality)
+        if detail is not None:
+            result["image_detail"] = detail
+
+        narrate_logger = getattr(agent, "logger", None)
+        if narrate_logger:
+            narrate_logger.middleware(
+                "PreIteration", f"Injected {len(processed)} file(s) before iteration {iteration}.",
+            )
+        return result
+
+    async def abefore_iteration(self, iteration: int, agent: Any = None) -> Optional[Dict[str, Any]]:
+        """Async twin of before_iteration -- offloads to a worker thread
+        (matching _amaybe_summarize's identical pattern) instead of
+        blocking the event loop for the callback/image-preprocessing work."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.before_iteration, iteration, agent)
+
+    def cleanup(self) -> None:
+        """Remove temp files created during this run, skipping any file
+        still referenced by the shared _image_cache -- see
+        PreIterationMiddleware._cleanup_temp_files' identical docstring."""
+        if not self._created_temp_files:
+            return
+        with _image_cache_lock:
+            live_cached_paths = {v[1] for v in _image_cache.values()}
+        for tmp_path in self._created_temp_files:
+            if tmp_path in live_cached_paths:
+                continue
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                self.logger.debug(
+                    "Could not remove temp file %r during cleanup", tmp_path, exc_info=True,
+                )
+        self._created_temp_files = []

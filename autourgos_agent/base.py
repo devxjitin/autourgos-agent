@@ -1516,6 +1516,8 @@ class AgentLoopMixin:
                 cb.fire_agent_end(final_answer, agent=self)
                 self._history.finish(final_answer)
                 self._preiteration.cleanup()
+                if self._toolbox is not None:
+                    self._toolbox.restore(self)
                 if logger:
                     logger.final_answer(final_answer)
                 return final_answer
@@ -1741,6 +1743,8 @@ class AgentLoopMixin:
                 await cb.afire_agent_end(final_answer, agent=self)
                 self._history.finish(final_answer)
                 self._preiteration.cleanup()
+                if self._toolbox is not None:
+                    self._toolbox.restore(self)
                 if logger:
                     logger.final_answer(final_answer)
                 return final_answer
@@ -2122,6 +2126,8 @@ class AgentLoopMixin:
                 cb.fire_agent_end(final_answer, agent=self)
                 self._history.finish(final_answer)
                 self._preiteration.cleanup()
+                if self._toolbox is not None:
+                    self._toolbox.restore(self)
                 if logger:
                     logger.final_answer(final_answer)
                 return final_answer
@@ -2254,6 +2260,8 @@ class AgentLoopMixin:
                 await cb.afire_agent_end(final_answer, agent=self)
                 self._history.finish(final_answer)
                 self._preiteration.cleanup()
+                if self._toolbox is not None:
+                    self._toolbox.restore(self)
                 if logger:
                     logger.final_answer(final_answer)
                 return final_answer

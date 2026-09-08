@@ -31,7 +31,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from autourgos_core import Toolbox
 
 from ._preiteration import _NULL_PREITERATION, _PreIterationRuntime
-from ._toolbox import ToolboxMiddleware
+from ._toolbox import _ToolboxRuntime
 from .base import (
     AgentAlreadyRunningError,
     AgentLoopMixin,
@@ -159,9 +159,7 @@ class Agent(AgentLoopMixin, BaseAgent):
         is shown) until the agent calls `expose_toolbox(name)` or
         `expose_tool(tool_name)` at runtime. Keeps the context window clean
         when you have many tools but a given run only needs a few. Built
-        internally on the same middleware mechanism as `middleware=`
-        (adds a ToolboxMiddleware instance), so it composes with any other
-        middleware you also pass. See autourgos_core.Toolbox.
+        directly into the agent loop, not middleware -- see autourgos_core.Toolbox.
     system_prompt : str
         Extra system-level instruction prepended to all requests.
     tool_calling_mode : "prompt" | "native"
@@ -329,8 +327,10 @@ class Agent(AgentLoopMixin, BaseAgent):
         )
         if on_agent_start is not None:
             self.add_middleware(_FunctionStartHandler(on_agent_start))
-        if toolbox:
-            self.add_middleware(ToolboxMiddleware(toolboxes=toolbox))
+        # Inline (non-middleware) toolbox lazy-loading -- see _toolbox
+        # module docstring for why native features of this package are
+        # plain constructor kwargs, not middleware.
+        self._toolbox = _ToolboxRuntime(toolboxes=toolbox) if toolbox else None
         self._history = _HistoryRecorder(folder=history) if history else _NULL_HISTORY
         # Inline (non-middleware) pre-iteration file/callback injection --
         # native features of this package are plain constructor kwargs,
@@ -342,6 +342,27 @@ class Agent(AgentLoopMixin, BaseAgent):
             if (pre_iteration_callback is not None or pre_iteration_files is not None)
             else _NULL_PREITERATION
         )
+
+    def add_toolbox(self, name: str, description: str, tools: List[Any]) -> "Agent":
+        """
+        Register a lazy-loaded toolbox after construction -- the dynamic
+        equivalent of passing `toolbox=[...]` to the constructor. Can be
+        called before or after this agent's first `invoke()`/`ainvoke()`.
+
+        Args:
+            name: Unique identifier for this toolbox (e.g. "github").
+            description: One-sentence description shown to the agent so it
+                knows when to expose this toolbox.
+            tools: Tools in this toolbox -- @tool-decorated functions,
+                plain callables, or already-shaped tool dicts.
+
+        Raises ValueError if any tool name in `tools` already exists in a
+        different, previously-registered toolbox.
+        """
+        if self._toolbox is None:
+            self._toolbox = _ToolboxRuntime()
+        self._toolbox.add_toolbox(name, description, tools)
+        return self
 
     # ── response parser ────────────────────────────────────────────────────────
 
@@ -417,6 +438,8 @@ class Agent(AgentLoopMixin, BaseAgent):
 
             self.callback_manager.fire_agent_start(query, agent=self)
             self._history.start(query, agent_name=self.__class__.__name__)
+            if self._toolbox is not None:
+                self._toolbox.start(self)
             self.logger.run_start(query)
 
             if self.tool_calling_mode == "native":
@@ -442,6 +465,8 @@ class Agent(AgentLoopMixin, BaseAgent):
             self.callback_manager.fire_agent_error(exc, agent=self)
             self._history.fail(exc)
             self._preiteration.cleanup()
+            if self._toolbox is not None:
+                self._toolbox.restore(self)
             raise
         finally:
             with self._run_lock:
@@ -489,6 +514,8 @@ class Agent(AgentLoopMixin, BaseAgent):
 
             await self.callback_manager.afire_agent_start(query, agent=self)
             self._history.start(query, agent_name=self.__class__.__name__)
+            if self._toolbox is not None:
+                self._toolbox.start(self)
             self.logger.run_start(query)
 
             if self.tool_calling_mode == "native":
@@ -512,6 +539,8 @@ class Agent(AgentLoopMixin, BaseAgent):
             await self.callback_manager.afire_agent_error(exc, agent=self)
             self._history.fail(exc)
             self._preiteration.cleanup()
+            if self._toolbox is not None:
+                self._toolbox.restore(self)
             raise
         finally:
             with self._run_lock:

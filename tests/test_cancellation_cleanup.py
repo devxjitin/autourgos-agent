@@ -19,8 +19,8 @@ from autourgos_agent import Agent, CallbackHandler
 
 class _CleanupTrackingMiddleware(CallbackHandler):
     """Mirrors the real middleware pattern: add a tool in on_agent_start,
-    remove it in on_agent_end/on_agent_error -- exactly like SkillLibrary/
-    ToolboxMiddleware's load_skill/expose_toolbox meta-tools."""
+    remove it in on_agent_end/on_agent_error -- exactly like autourgos-skills'
+    SkillLibrary's load_skill meta-tool."""
 
     def __init__(self) -> None:
         self.error_calls = []

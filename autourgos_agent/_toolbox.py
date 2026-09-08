@@ -3,11 +3,14 @@ _toolbox.py -- native Agent(toolbox=[...]) support.
 
 Ported from the (now retired) standalone autourgos-toolbox package: same
 lazy-loading behavior (toolbox names/descriptions shown upfront, tools
-loaded on demand via expose_toolbox/expose_tool meta-tools), just wired in
-as Agent's own middleware instead of a separate package -- Toolbox itself
-now lives in autourgos-core (autourgos_core.toolbox) alongside the @tool
-decorator, and Agent(toolbox=[...]) builds a _ToolboxMiddleware from it
-internally (see agent.py).
+loaded on demand via expose_toolbox/expose_tool meta-tools), folded
+directly into the agent loop as a plain constructor kwarg (Agent(toolbox=
+[...]) builds a _ToolboxRuntime internally -- see agent.py) rather than
+through the CallbackHandler/middleware bus -- native features of this
+package are kwargs, not middleware; that bus is reserved for third-party
+extensions (autourgos-hcix, autourgos-skills, your own code). Toolbox
+itself lives in autourgos-core (autourgos_core.toolbox) alongside the
+@tool decorator.
 """
 from __future__ import annotations
 
@@ -16,12 +19,12 @@ import json
 import logging
 from typing import Any, Callable, Dict, List, Optional, Union
 
-from autourgos_core import PerAgentRegistry, Toolbox, infer_json_schema
+from autourgos_core import Toolbox, infer_json_schema
 
-from .base import CallbackHandler, _tool_name
+from .base import _tool_name
 from .runtime import inject_prompt_block, remove_prompt_block
 
-__all__ = ["StructuredTool", "ToolboxMiddleware"]
+__all__ = ["StructuredTool"]
 
 logger = logging.getLogger(__name__)
 
@@ -122,12 +125,15 @@ def _to_agent_tool_dict(tool: Any) -> Any:
     return tool
 
 
-class ToolboxMiddleware(CallbackHandler):
+class _ToolboxRuntime:
     """
-    Middleware for dynamic lazy-loading and sandboxing of toolboxes.
-
-    Built by Agent(toolbox=[...]) internally -- most callers never
-    construct this directly.
+    Inline (non-middleware) dynamic lazy-loading and sandboxing of
+    toolboxes, built directly by Agent(toolbox=[...]) -- mirrors
+    _PreIterationRuntime/_HistoryRecorder's pattern: this only ever
+    applies to the ONE Agent instance it's configured on, so a flat
+    ``self._run_state`` dict is safe (no PerAgentRegistry needed) since
+    Agent's own _run_lock already guarantees only one run is ever active
+    per instance at a time.
     """
 
     def __init__(
@@ -137,8 +143,7 @@ class ToolboxMiddleware(CallbackHandler):
         self.logger    = logging.getLogger(__name__)
         self.toolboxes: Dict[str, Toolbox] = {}
 
-        self._runs: "PerAgentRegistry[Dict[str, Any]]" = PerAgentRegistry()
-        self._last_agent: Optional[Any] = None
+        self._run_state: Optional[Dict[str, Any]] = None
 
         if toolboxes:
             if isinstance(toolboxes, list):
@@ -168,24 +173,22 @@ class ToolboxMiddleware(CallbackHandler):
                 )
         self.toolboxes[name] = Toolbox(name, description, tools)
 
-    # ── lifecycle hooks ───────────────────────────────────────────────────
+    # ── lifecycle (called directly by Agent.invoke()/ainvoke(), not middleware) ──
 
-    def on_agent_start(self, query: str, agent: Any = None, **kwargs: Any) -> None:
-        if agent is None:
-            agent = kwargs.get("agent")
-        if agent is None:
-            return
-
+    def start(self, agent: Any) -> None:
+        """Called once at the start of a run: registers the expose_toolbox/
+        expose_tool meta-tools and injects the toolbox catalog into the
+        prompt. Raises ValueError if the agent already has a tool named
+        expose_toolbox/expose_tool (this feature reserves those names)."""
         existing_names = {self._get_tool_name(t) for t in getattr(agent, "tools", [])}
         conflicts = RESERVED_TOOL_NAMES & existing_names
         if conflicts:
             raise ValueError(
-                f"ToolboxMiddleware cannot start: the agent already has tool(s) named "
-                f"{sorted(conflicts)!r}, which this middleware reserves for its own "
+                f"Agent(toolbox=...) cannot start: the agent already has tool(s) named "
+                f"{sorted(conflicts)!r}, which this feature reserves for its own "
                 f"meta-tools. Rename your tool(s), or remove toolbox=."
             )
 
-        self._last_agent = agent
         run_state: Dict[str, Any] = {
             "added_tools":     [],
             "injected_blocks": [],
@@ -193,7 +196,7 @@ class ToolboxMiddleware(CallbackHandler):
             "exposed_tools":   set(),
             "displaced":       {},
         }
-        self._runs.set(agent, run_state)
+        self._run_state = run_state
 
         def expose_toolbox(toolbox_name: str) -> str:
             """Expose all tools in the specified toolbox, making them available for you to use.
@@ -248,17 +251,17 @@ class ToolboxMiddleware(CallbackHandler):
             )
             run_state["injected_blocks"].append(inject_prompt_block(agent, instruction))
 
-    def on_agent_end(self, response: str, agent: Any = None, **kwargs: Any) -> None:
-        self._restore_agent(agent or self._last_agent)
-
-    def on_agent_error(self, error: Exception, agent: Any = None, **kwargs: Any) -> None:
-        self._restore_agent(agent or self._last_agent)
+    def restore(self, agent: Any) -> None:
+        """Called at the end of a run (success or error): removes the
+        meta-tools/injected schemas this run added and restores any tool
+        it temporarily displaced, so the agent returns to its exact
+        pre-run state before the next invoke()/ainvoke()."""
+        self._restore_agent(agent)
 
     # ── internal ──────────────────────────────────────────────────────────
 
-    def _expose_toolbox_action(self, toolbox_name: str, agent: Any = None) -> str:
-        agent = agent or self._last_agent
-        run_state = self._runs.peek(agent) if agent is not None else None
+    def _expose_toolbox_action(self, toolbox_name: str, agent: Any) -> str:
+        run_state = self._run_state
         if agent is None or run_state is None:
             return "Error: No active agent reference found."
 
@@ -315,9 +318,8 @@ class ToolboxMiddleware(CallbackHandler):
                     return tool
         return None
 
-    def _expose_tool_action(self, tool_name: str, agent: Any = None) -> str:
-        agent = agent or self._last_agent
-        run_state = self._runs.peek(agent) if agent is not None else None
+    def _expose_tool_action(self, tool_name: str, agent: Any) -> str:
+        run_state = self._run_state
         if agent is None or run_state is None:
             return "Error: No active agent reference found."
 
@@ -355,7 +357,8 @@ class ToolboxMiddleware(CallbackHandler):
     def _restore_agent(self, agent: Any = None) -> None:
         if agent is None:
             return
-        run_state = self._runs.pop(agent, None)
+        run_state = self._run_state
+        self._run_state = None
         if run_state is None:
             return
         if hasattr(agent, "tools") and run_state["added_tools"]:
@@ -368,5 +371,3 @@ class ToolboxMiddleware(CallbackHandler):
                     agent.tools.append(original)
         for block in run_state["injected_blocks"]:
             remove_prompt_block(agent, block)
-        if self._last_agent is agent:
-            self._last_agent = None

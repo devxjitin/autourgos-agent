@@ -36,7 +36,6 @@ Lazy-loaded toolboxes::
 from autourgos_core import Toolbox
 
 from .agent   import Agent
-from ._toolbox import ToolboxMiddleware
 from ._preiteration import PARALLEL, SEQUENTIAL, is_async_callable
 from .base    import (
     BaseLLM,
@@ -74,7 +73,7 @@ def Create_Agent(*args: object, **kwargs: object) -> Agent:
 
 from autourgos_core import package_version
 
-__version__ = package_version("autourgos-agent", fallback="3.10.0")
+__version__ = package_version("autourgos-agent", fallback="3.11.0")
 
 __all__ = [
     "Agent",
@@ -105,7 +104,6 @@ __all__ = [
     "Tool",
     # native toolbox support (Agent(toolbox=[...]))
     "Toolbox",
-    "ToolboxMiddleware",
     # pre-iteration callback/file hooks (Agent(pre_iteration_callback=..., pre_iteration_files=...))
     "SEQUENTIAL",
     "PARALLEL",

@@ -1,5 +1,11 @@
 # Changelog
 
+## [3.11.0] - 2026-09-08
+
+- **Removed:** `ToolboxMiddleware`. Superseded by an inline `_ToolboxRuntime` built directly by `Agent(toolbox=[...])` -- same reasoning as `PreIterationMiddleware`'s removal in 3.10.0: native features of this package are plain constructor kwargs/methods, not middleware. **Breaking change** for anyone using `from autourgos_agent import ToolboxMiddleware` / `middleware=[ToolboxMiddleware(...)]` -- use `toolbox=[...]` on the constructor instead.
+- **Added:** `Agent.add_toolbox(name, description, tools)` -- the post-construction equivalent of `toolbox=[...]`, replacing the old `ToolboxMiddleware() + mw.add_toolbox(...) + agent.add_middleware(mw)` pattern for registering a toolbox dynamically after the agent is built. Works whether or not `toolbox=` was also passed to the constructor.
+- Internal: `_ToolboxRuntime` uses flat instance state instead of `PerAgentRegistry` (a single Agent instance's `_run_lock` already guarantees only one run is ever active at a time, so no cross-instance-sharing machinery is needed) -- same simplification as `_PreIterationRuntime` in 3.10.0.
+
 ## [3.10.0] - 2026-09-08
 
 - **Added:** `Agent(pre_iteration_callback=..., pre_iteration_files=..., image_quality=...)` -- run a callback and/or inject files (e.g. a fresh screenshot) before every iteration, built directly into the agent loop rather than via `middleware=`. Matches the `history=`/`summarize_every=` pattern: this only ever applies to the one `Agent` instance it's configured on, so it needs none of a middleware's cross-instance-sharing machinery. The async path offloads to a worker thread (`run_in_executor`) so a slow callback/image-preprocess never blocks the event loop. See README's [Pre-Iteration Files & Callbacks](README.md#pre-iteration-files--callbacks).

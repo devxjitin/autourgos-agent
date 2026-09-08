@@ -734,20 +734,19 @@ produced the line, e.g.:
 
 Use `getattr(agent, "logger", None)` (not a direct import of `AgentLogger`) so your
 middleware doesn't crash if it's ever attached to something other than a `Agent`,
-and does nothing when `verbose=False`. The built-in summarizer and pre-iteration
-runtime (see [Auto-Summarizing Scratchpad](#auto-summarizing-scratchpad) and
-[Pre-Iteration Files & Callbacks](#pre-iteration-files--callbacks) — both
-implemented inline, not as middleware, but narrate the same way), the built-in
-`ToolboxMiddleware` (see [Toolboxes](#toolboxes-lazy-loaded-tool-groups)), and
-sibling middleware packages (e.g. `autourgos-hcix`, `autourgos-skills`) all use
-this same pattern to narrate their own actions.
+and does nothing when `verbose=False`. The built-in summarizer, toolbox, and
+pre-iteration runtimes (see [Auto-Summarizing Scratchpad](#auto-summarizing-scratchpad),
+[Toolboxes](#toolboxes-lazy-loaded-tool-groups), and
+[Pre-Iteration Files & Callbacks](#pre-iteration-files--callbacks) — all three
+implemented inline, not as middleware, but narrate the same way) and sibling
+middleware packages (e.g. `autourgos-hcix`, `autourgos-skills`) all use this
+same pattern to narrate their own actions.
 
 ### Middleware Integration Contract
 
-These are the three pieces of surface area sibling middleware (the
-built-in `ToolboxMiddleware`, `autourgos-hcix`, `autourgos-skills`, and
-anything else you write) can rely on. This is the official, stable
-contract — treat it as public API.
+These are the three pieces of surface area sibling middleware
+(`autourgos-hcix`, `autourgos-skills`, and anything else you write) can
+rely on. This is the official, stable contract — treat it as public API.
 
 **`agent.scratchpad` (str)**
 A real, live instance attribute, not just a local loop variable. It is
@@ -925,16 +924,12 @@ agent = Agent(
 )
 ```
 
-`toolbox=` is sugar for `add_middleware(ToolboxMiddleware(toolboxes=[...]))`
-under the hood — `ToolboxMiddleware` and `Toolbox` are both importable from
-`autourgos_agent`/`autourgos_core` if you need to build one dynamically:
+`toolbox=` is built directly into the agent loop, not middleware. Register
+a toolbox dynamically after construction with `agent.add_toolbox(...)`:
 
 ```python
-from autourgos_agent import ToolboxMiddleware
-
-mw = ToolboxMiddleware()
-mw.add_toolbox("web", "Web search and page scraping tools.", [web_search, scrape_url])
-agent.add_middleware(mw)
+agent = Agent(llm=OpenAIChatModel(model="gpt-4o"))
+agent.add_toolbox("web", "Web search and page scraping tools.", [web_search, scrape_url])
 ```
 
 ---

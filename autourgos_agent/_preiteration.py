@@ -1,0 +1,465 @@
+"""
+_preiteration.py -- SEQUENTIAL, PARALLEL, and PreIterationMiddleware.
+
+Ported from the (now retired) standalone autourgos-preiteration package.
+Run callbacks and inject files (screenshots, docs) before each agent
+iteration -- sync and async hooks, sequential and parallel execution, and
+automatic image compression to reduce LLM token costs.
+"""
+from __future__ import annotations
+
+import asyncio
+import collections
+import concurrent.futures
+import inspect
+import logging
+import os
+import tempfile
+import threading
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Union
+
+from autourgos_core import RunScopedState
+
+from .base import CallbackHandler
+
+__all__ = ["PreIterationMiddleware", "SEQUENTIAL", "PARALLEL", "is_async_callable"]
+
+
+# ── helpers ────────────────────────────────────────────────────────────────
+
+def _run_coroutine_sync(coro: Any) -> Any:
+    """
+    Run a coroutine to completion from synchronous code, safe whether or
+    not the calling thread already has a running event loop.
+
+    ``on_iteration_start`` is a sync CallbackHandler hook, but
+    ``agent.ainvoke()`` calls it directly from the event-loop thread (not
+    via a separate thread), so ``asyncio.get_running_loop()`` succeeding
+    here means the loop IS the current thread. Running the coroutine on an
+    isolated thread with its own fresh loop sidesteps deadlocking that
+    thread against its own loop.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    outcome: Dict[str, Any] = {}
+
+    def _runner() -> None:
+        try:
+            outcome["result"] = asyncio.run(coro)
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread below
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    thread.join()
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("result")
+
+
+def is_async_callable(obj: Any) -> bool:
+    if obj is None:
+        return False
+    if inspect.iscoroutinefunction(obj):
+        return True
+    if hasattr(obj, "__call__") and inspect.iscoroutinefunction(obj.__call__):
+        return True
+    if hasattr(obj, "_is_async") and getattr(obj, "_is_async"):
+        return True
+    return False
+
+
+# ── SEQUENTIAL ────────────────────────────────────────────────────────────
+
+class SEQUENTIAL:
+    """
+    Run multiple pre-iteration hooks one after another.
+
+    Supports both sync and async callables. If any hook is async the whole
+    chain becomes async and must be awaited.
+
+    Example
+    -------
+    ::
+
+        from autourgos_agent import SEQUENTIAL, PreIterationMiddleware
+
+        def capture_screen(iteration: int) -> None:
+            take_screenshot(f"step_{iteration}.png")
+
+        def log_step(iteration: int) -> None:
+            print(f"Iteration {iteration} starting")
+
+        middleware = PreIterationMiddleware(
+            callback=SEQUENTIAL[capture_screen, log_step]
+        )
+    """
+
+    def __init__(self, *funcs: Callable[[int], Any]) -> None:
+        self.funcs     = [f for f in funcs if f is not None]
+        self._is_async = any(is_async_callable(f) for f in self.funcs)
+
+    def __class_getitem__(cls, item: Any) -> "SEQUENTIAL":
+        if not isinstance(item, tuple):
+            item = (item,)
+        return cls(*item)
+
+    def __call__(self, iteration: int) -> Any:
+        if self._is_async:
+            return self._run_async(iteration)
+        for func in self.funcs:
+            func(iteration)
+        return None
+
+    async def _run_async(self, iteration: int) -> None:
+        for func in self.funcs:
+            if is_async_callable(func):
+                await func(iteration)
+            else:
+                res = func(iteration)
+                if inspect.iscoroutine(res):
+                    await res
+
+
+# ── PARALLEL ──────────────────────────────────────────────────────────────
+
+class PARALLEL:
+    """
+    Run multiple pre-iteration hooks at the same time.
+
+    Sync hooks run in a ``ThreadPoolExecutor``; async hooks run as
+    ``asyncio`` tasks. Results (and errors) are gathered before the
+    agent continues.
+
+    Example
+    -------
+    ::
+
+        from autourgos_agent import PARALLEL, PreIterationMiddleware
+
+        middleware = PreIterationMiddleware(
+            callback=PARALLEL[capture_screen, refresh_cache, ping_health_check]
+        )
+    """
+
+    def __init__(self, *funcs: Callable[[int], Any]) -> None:
+        self.funcs     = [f for f in funcs if f is not None]
+        self._is_async = any(is_async_callable(f) for f in self.funcs)
+
+    def __class_getitem__(cls, item: Any) -> "PARALLEL":
+        if not isinstance(item, tuple):
+            item = (item,)
+        return cls(*item)
+
+    def __call__(self, iteration: int) -> Any:
+        if self._is_async:
+            return self._run_async(iteration)
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, len(self.funcs))
+        ) as executor:
+            futures = [executor.submit(func, iteration) for func in self.funcs]
+            concurrent.futures.wait(futures)
+            for fut in futures:
+                fut.result()  # re-raises any exceptions
+        return None
+
+    async def _run_async(self, iteration: int) -> None:
+        loop = asyncio.get_running_loop()
+
+        tasks = []
+        for func in self.funcs:
+            if is_async_callable(func):
+                tasks.append(asyncio.ensure_future(func(iteration)))
+            else:
+                tasks.append(loop.run_in_executor(None, func, iteration))
+        if tasks:
+            await asyncio.gather(*tasks)
+
+
+# ── image helpers ─────────────────────────────────────────────────────────
+
+_IMAGE_QUALITY_TIERS: Dict[str, Tuple] = {
+    "low":    (512,  60,   "low"),
+    "medium": (768,  70,   "auto"),
+    "high":   (None, None, "high"),
+    "auto":   (None, None, "auto"),
+}
+
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+
+# (source_path, quality_key) -> (mtime, preprocessed_path)
+#
+# Keyed WITHOUT mtime so there is at most one live entry per (path, quality):
+# when the source file's mtime changes (e.g. a screenshot re-taken every
+# iteration), the stale entry's temp file is deleted immediately below
+# instead of being left to accumulate forever.
+_image_cache: "collections.OrderedDict[Tuple[str, str], Tuple[float, str]]" = collections.OrderedDict()
+_image_cache_lock = threading.Lock()
+# Caps distinct (path, quality) entries -- dynamic files= callables that
+# generate a new source path every iteration would otherwise grow this
+# process-lifetime global cache and its backing temp files without bound.
+_IMAGE_CACHE_MAX_ENTRIES = 256
+
+
+def _is_image(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in _IMAGE_EXTENSIONS
+
+
+def _detail_for(image_quality: Union[str, int]) -> Optional[str]:
+    if isinstance(image_quality, int):
+        return "low" if image_quality <= 512 else "auto"
+    tier = _IMAGE_QUALITY_TIERS.get(str(image_quality).lower())
+    return tier[2] if tier else "auto"
+
+
+def _preprocess_image(
+    path: str,
+    image_quality: Union[str, int],
+    logger: logging.Logger,
+    created_files: Optional[List[str]] = None,
+) -> str:
+    """Resize and re-encode an image based on image_quality. Results are cached."""
+    quality_key = str(image_quality)
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return path
+
+    cache_key = (path, quality_key)
+    with _image_cache_lock:
+        cached = _image_cache.get(cache_key)
+        if cached is not None:
+            _image_cache.move_to_end(cache_key)
+    if cached is not None:
+        cached_mtime, cached_path = cached
+        if cached_mtime == mtime and os.path.exists(cached_path):
+            return cached_path
+
+    if isinstance(image_quality, int):
+        jpeg_quality = max(1, min(100, image_quality))
+        max_dim      = 512 if image_quality <= 512 else None
+    else:
+        tier = _IMAGE_QUALITY_TIERS.get(
+            str(image_quality).lower(), _IMAGE_QUALITY_TIERS["auto"]
+        )
+        max_dim, jpeg_quality, _ = tier
+
+    if max_dim is None and jpeg_quality is None:
+        return path
+
+    try:
+        from PIL import Image  # type: ignore
+    except ImportError:
+        logger.warning(
+            "Pillow is not installed — image resize/recompress skipped. "
+            "Install with: pip install 'autourgos-agent[images]'. "
+            "The image_detail hint is still applied for OpenAI token savings."
+        )
+        return path
+
+    try:
+        with Image.open(path) as src:
+            img = src.convert("RGB")
+        if max_dim is not None:
+            w, h = img.size
+            if max(w, h) > max_dim:
+                scale = max_dim / max(w, h)
+                img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=".jpg", prefix="autourgos_img_", delete=False
+        )
+        tmp.close()
+        img.save(tmp.name, format="JPEG", quality=jpeg_quality, optimize=True)
+        evicted: List[str] = []
+        with _image_cache_lock:
+            stale = _image_cache.get(cache_key)
+            _image_cache[cache_key] = (mtime, tmp.name)
+            _image_cache.move_to_end(cache_key)
+            while len(_image_cache) > _IMAGE_CACHE_MAX_ENTRIES:
+                _, (_, evicted_path) = _image_cache.popitem(last=False)
+                evicted.append(evicted_path)
+        if stale is not None and stale[1] != tmp.name:
+            try:
+                os.remove(stale[1])
+            except OSError:
+                pass
+        for evicted_path in evicted:
+            try:
+                os.remove(evicted_path)
+            except OSError:
+                pass
+        if created_files is not None:
+            created_files.append(tmp.name)
+        return tmp.name
+    except Exception as exc:
+        logger.warning(
+            f"Image preprocessing failed for {path!r}: {exc}. Using original."
+        )
+        return path
+
+
+# ── PreIterationMiddleware ────────────────────────────────────────────────
+
+class PreIterationMiddleware(CallbackHandler):
+    """
+    Middleware that executes a callback and/or injects files before each
+    agent iteration.
+
+    Use this to:
+
+    * Take a screenshot before every iteration and feed it to the LLM.
+    * Refresh a live data feed, clear a cache, or ping a health endpoint.
+    * Run any custom logic (sync or async) at the start of each loop.
+
+    Parameters
+    ----------
+    callback : callable, optional
+        Sync or async ``callable(iteration: int)``. Wrap multiple callables
+        with :class:`SEQUENTIAL` or :class:`PARALLEL`.
+    files : str, list of str, or callable(iteration) -> str | list, optional
+        File path(s) to inject into the LLM at every iteration. Pass a
+        callable to generate paths dynamically (e.g. a screenshot that
+        changes every iteration).
+    image_quality : str or int
+        Controls screenshot token cost. Options:
+
+        * ``"auto"`` (default) — no change, backward-compatible.
+        * ``"high"`` — forces ``detail="high"``, no resize.
+        * ``"medium"`` — downscales to ≤768 px, JPEG q70, ``detail="auto"``.
+        * ``"low"`` — downscales to ≤512 px, JPEG q60, ``detail="low"`` (~85 tokens flat).
+        * ``int`` 1–100 — JPEG quality; ``detail="low"`` when ≤512 else ``"auto"``.
+
+        Pillow is required for resize: ``pip install 'autourgos-agent[images]'``.
+
+    Example
+    -------
+    ::
+
+        from autourgos_agent import Agent, PreIterationMiddleware
+
+        SCREENSHOT = "/tmp/screen.png"
+
+        def capture(iteration: int) -> None:
+            take_screenshot(SCREENSHOT)
+
+        middleware = PreIterationMiddleware(
+            callback=capture,
+            files=SCREENSHOT,
+            image_quality="low",
+        )
+        agent = Agent(llm=my_llm, middleware=[middleware])
+    """
+
+    def __init__(
+        self,
+        callback: Optional[Callable[[int], Union[None, Awaitable[None]]]] = None,
+        files: Optional[
+            Union[str, List[str], Callable[[int], Optional[Union[str, List[str]]]]]
+        ] = None,
+        image_quality: Union[str, int] = "auto",
+    ) -> None:
+        if isinstance(image_quality, int):
+            if not (1 <= image_quality <= 100):
+                raise ValueError("image_quality as int must be between 1 and 100.")
+        elif str(image_quality).lower() not in _IMAGE_QUALITY_TIERS:
+            raise ValueError(
+                f"image_quality must be one of {list(_IMAGE_QUALITY_TIERS)} or int 1-100, "
+                f"got {image_quality!r}."
+            )
+        self.callback      = callback
+        self._files        = files
+        self.image_quality = image_quality
+        # Run-scoped (contextvars-backed), not a flat instance attribute --
+        # see RunScopedState: a flat attribute would let two concurrent runs
+        # sharing this one middleware instance clobber each other's state.
+        self._current_kwargs: "RunScopedState[Dict[str, Any]]" = RunScopedState(default_factory=dict)
+        self.logger = logging.getLogger(__name__)
+        self._created_temp_files: "RunScopedState[List[str]]" = RunScopedState(default_factory=list)
+
+    def on_iteration_start(self, iteration: int, agent: Any = None, **kwargs: Any) -> None:
+        if self.callback:
+            try:
+                res = self.callback(iteration)
+                if inspect.iscoroutine(res):
+                    _run_coroutine_sync(res)
+            except Exception as exc:
+                self.logger.error(
+                    f"Error in pre-iteration callback at iteration {iteration}: {exc}"
+                )
+
+        current_kwargs = self._current_kwargs.reset()
+        if self._files is not None:
+            resolved = self._files(iteration) if callable(self._files) else self._files
+            if resolved:
+                raw: List[str] = []
+                if isinstance(resolved, list):
+                    raw = [f for f in resolved if f and os.path.exists(f)]
+                elif isinstance(resolved, str) and os.path.exists(resolved):
+                    raw = [resolved]
+
+                if raw:
+                    processed = [
+                        _preprocess_image(
+                            f, self.image_quality, self.logger,
+                            created_files=self._created_temp_files.get(),
+                        )
+                        if _is_image(f) else f
+                        for f in raw
+                    ]
+                    current_kwargs["files"] = processed
+                    detail = _detail_for(self.image_quality)
+                    if detail is not None:
+                        current_kwargs["image_detail"] = detail
+
+                    narrate_logger = getattr(agent, "logger", None)
+                    if narrate_logger:
+                        narrate_logger.middleware(
+                            "PreIteration",
+                            f"Injected {len(processed)} file(s) before iteration {iteration}.",
+                        )
+
+    def get_injection_kwargs(self) -> Dict[str, Any]:
+        """Return file-injection kwargs to pass to the LLM call."""
+        return dict(self._current_kwargs.get())
+
+    def on_before_iteration(self, iteration: int, agent: Any = None, **kwargs: Any) -> Optional[Dict[str, Any]]:
+        """
+        Fired right before the LLM is invoked for this iteration. Returns
+        whatever files/image_detail kwargs were already resolved for this
+        iteration by on_iteration_start (which the loop calls first), so
+        they get merged into that iteration's llm.invoke()/ainvoke() call.
+        """
+        injection = self.get_injection_kwargs()
+        return injection or None
+
+    def _cleanup_temp_files(self) -> None:
+        """
+        Remove temp files created during this run by ``_preprocess_image``,
+        skipping any file still referenced by the shared ``_image_cache``
+        (so a later run with the same unchanged image can still hit the
+        cache and reuse it without reprocessing).
+        """
+        created_temp_files = self._created_temp_files.get()
+        if not created_temp_files:
+            return
+        with _image_cache_lock:
+            live_cached_paths = {v[1] for v in _image_cache.values()}
+        for tmp_path in created_temp_files:
+            if tmp_path in live_cached_paths:
+                continue
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                self.logger.debug(
+                    "Could not remove temp file %r during cleanup", tmp_path, exc_info=True,
+                )
+        self._created_temp_files.reset()
+
+    def on_agent_end(self, response: str, agent: Any = None, **kwargs: Any) -> None:
+        self._cleanup_temp_files()
+
+    def on_agent_error(self, error: Exception, agent: Any = None, **kwargs: Any) -> None:
+        self._cleanup_temp_files()

@@ -28,6 +28,9 @@ import inspect
 import threading
 from typing import Any, Callable, Dict, List, Optional
 
+from autourgos_core import Toolbox
+
+from ._toolbox import ToolboxMiddleware
 from .base import AgentAlreadyRunningError, AgentLoopMixin, BaseAgent, CallbackHandler, MemoryProtocol
 from .history import _NULL_HISTORY, _HistoryRecorder
 from .logging import AgentLogger
@@ -155,6 +158,15 @@ class Agent(AgentLoopMixin, BaseAgent):
         Number of consecutive JSON parse failures before giving up.
     tools : list[dict], optional
         Initial tool list. More can be added with add_tools().
+    toolbox : list[Toolbox], optional
+        Toolboxes to lazy-load into this agent -- groups of tools that stay
+        hidden from the initial prompt (only each toolbox's name/description
+        is shown) until the agent calls `expose_toolbox(name)` or
+        `expose_tool(tool_name)` at runtime. Keeps the context window clean
+        when you have many tools but a given run only needs a few. Built
+        internally on the same middleware mechanism as `middleware=`
+        (adds a ToolboxMiddleware instance), so it composes with any other
+        middleware you also pass. See autourgos_core.Toolbox.
     system_prompt : str
         Extra system-level instruction prepended to all requests.
     tool_calling_mode : "prompt" | "native"
@@ -241,6 +253,7 @@ class Agent(AgentLoopMixin, BaseAgent):
         middleware: Optional[List[CallbackHandler]] = None,
         max_consecutive_parse_errors: int = 3,
         tools: Optional[List[Any]] = None,
+        toolbox: Optional[List[Toolbox]] = None,
         system_prompt: str = "",
         tool_calling_mode: str = "prompt",
         max_scratchpad_chars: Optional[int] = None,
@@ -301,6 +314,8 @@ class Agent(AgentLoopMixin, BaseAgent):
         )
         if on_agent_start is not None:
             self.add_middleware(_FunctionStartHandler(on_agent_start))
+        if toolbox:
+            self.add_middleware(ToolboxMiddleware(toolboxes=toolbox))
         self._history = _HistoryRecorder(folder=history) if history else _NULL_HISTORY
 
     # ── response parser ────────────────────────────────────────────────────────

@@ -59,6 +59,10 @@ This continues until the agent has a final answer or hits the iteration/time lim
 - [Approval Callback](#approval-callback)
 - [Middleware / Callbacks](#middleware--callbacks)
   - [Middleware Integration Contract](#middleware-integration-contract)
+- [`on_agent_start` Shortcut](#on_agent_start-shortcut)
+- [Toolboxes (Lazy-Loaded Tool Groups)](#toolboxes-lazy-loaded-tool-groups)
+- [Pre-Iteration Middleware](#pre-iteration-middleware)
+- [Run History](#run-history)
 - [Pause & Resume](#pause--resume)
 - [Testing](#testing)
 - [Context Manager](#context-manager)
@@ -716,14 +720,17 @@ Use `getattr(agent, "logger", None)` (not a direct import of `AgentLogger`) so y
 middleware doesn't crash if it's ever attached to something other than a `Agent`,
 and does nothing when `verbose=False`. The built-in summarizer (see
 [Auto-Summarizing Scratchpad](#auto-summarizing-scratchpad) — implemented
-inline, not as middleware, but narrates the same way) and the Autourgos
-middleware packages (autourgos-toolbox, autourgos-hcix, autourgos-preiteration) use
-this same pattern to narrate their own actions.
+inline, not as middleware, but narrates the same way), the built-in
+`ToolboxMiddleware` and `PreIterationMiddleware` (both native to this
+package — see [Toolboxes](#toolboxes-lazy-loaded-tool-groups) and
+[Pre-Iteration Middleware](#pre-iteration-middleware)), and sibling
+middleware packages (e.g. autourgos-hcix) all use this same pattern to
+narrate their own actions.
 
 ### Middleware Integration Contract
 
-These are the three pieces of surface area sibling middleware packages
-(autourgos-hcix, autourgos-preiteration, autourgos-toolbox, and anything
+These are the three pieces of surface area sibling middleware (the built-in
+`ToolboxMiddleware`/`PreIterationMiddleware`, autourgos-hcix, and anything
 else you write) can rely on. This is the official, stable contract — treat
 it as public API.
 
@@ -797,6 +804,219 @@ class RemoteAudit(CallbackHandler):
 
 You don't need to pick one style for a whole handler — different hooks on
 the same class can mix sync and async freely.
+
+---
+
+## `on_agent_start` Shortcut
+
+For the common case of wanting one function to run every time an agent
+starts, without writing a full `CallbackHandler` subclass:
+
+```python
+def log_start(query: str) -> None:
+    print(f"Starting: {query}")
+
+agent = Agent(llm=llm, on_agent_start=log_start)
+```
+
+`on_agent_start` may be a plain function or an `async def` — both work from
+`invoke()` and `ainvoke()`. It's called as `fn(query)`, or `fn(query, agent=self)`
+if the function's signature accepts an `agent` kwarg:
+
+```python
+async def log_start(query: str, agent=None) -> None:
+    await audit_client.log(query, agent.current_query)
+
+agent = Agent(llm=llm, on_agent_start=log_start)
+```
+
+This is internally just sugar for `agent.add_middleware(...)` wrapping your
+function in a `CallbackHandler` — it fires alongside (after) any handlers
+passed via `middleware=`.
+
+---
+
+## Toolboxes (Lazy-Loaded Tool Groups)
+
+`toolbox=` groups tools under a name + description that stay **hidden**
+from the agent's prompt until it actually needs them — only each toolbox's
+name and one-line description are shown upfront. The agent calls the
+built-in `expose_toolbox(name)` (or `expose_tool(tool_name)` for a single
+tool) meta-tool at runtime to load the real tools. Useful when you have
+many tools across several domains but a given run only needs a handful —
+keeps the context window clean instead of dumping every tool's full schema
+into the prompt every time.
+
+```python
+from autourgos_core import tool, Toolbox
+from autourgos_agent import Agent
+from autourgos_openaichat import OpenAIChatModel
+
+@tool
+def web_search(query: str) -> str:
+    """Search the web."""
+    return f"Results for: {query}"
+
+@tool
+def scrape_url(url: str) -> str:
+    """Scrape a web page."""
+    return f"Scraped content of {url}"
+
+@tool
+def run_query(sql: str) -> str:
+    """Run a SQL query against the database."""
+    return f"Rows for: {sql}"
+
+@tool
+def list_tables() -> str:
+    """List all tables in the database."""
+    return "users, orders, products"
+
+web = Toolbox(name="web", description="Web search and page scraping tools.",
+              tools=[web_search, scrape_url])
+db  = Toolbox(name="database", description="SQL query tools.",
+              tools=[run_query, list_tables])
+
+agent = Agent(
+    llm=OpenAIChatModel(model="gpt-4o"),
+    toolbox=[web, db],
+)
+
+result = agent.invoke("Find the latest Python release and save it to the DB")
+```
+
+The agent first sees only:
+```
+## Dynamic Toolboxes
+- **web**: Web search and page scraping tools.
+- **database**: SQL query tools.
+```
+Then, when it decides it needs one, it calls `expose_toolbox("web")` (or
+`expose_tool("web_search")` for just that one tool), which registers the
+real tool(s) on the agent and injects their full schemas into the prompt
+for the rest of that run. Everything toolbox-related — meta-tools, injected
+schemas, displaced/restored tools — is automatically cleaned up at
+`on_agent_end`/`on_agent_error`, so the agent returns to its original state
+before the next `invoke()`.
+
+You can also mix `tools=` (always visible) with `toolbox=` (lazy-loaded)
+on the same agent:
+
+```python
+agent = Agent(
+    llm=OpenAIChatModel(model="gpt-4o"),
+    tools=[calculator],       # always in the prompt
+    toolbox=[web, db],        # hidden until expose_toolbox()/expose_tool() is called
+)
+```
+
+`toolbox=` is sugar for `add_middleware(ToolboxMiddleware(toolboxes=[...]))`
+under the hood — `ToolboxMiddleware` and `Toolbox` are both importable from
+`autourgos_agent`/`autourgos_core` if you need to build one dynamically:
+
+```python
+from autourgos_agent import ToolboxMiddleware
+
+mw = ToolboxMiddleware()
+mw.add_toolbox("web", "Web search and page scraping tools.", [web_search, scrape_url])
+agent.add_middleware(mw)
+```
+
+---
+
+## Pre-Iteration Middleware
+
+`PreIterationMiddleware` runs a callback and/or injects files (e.g. a fresh
+screenshot) before every agent iteration — useful for computer-use / vision
+agents, live data feeds, or anything that needs to refresh before each step.
+
+```python
+from autourgos_agent import Agent, PreIterationMiddleware
+from autourgos_openaichat import OpenAIChatModel
+
+SCREENSHOT = "/tmp/screen.png"
+
+def capture(iteration: int) -> None:
+    take_screenshot(SCREENSHOT)  # your own screenshot function
+
+middleware = PreIterationMiddleware(
+    callback=capture,
+    files=SCREENSHOT,
+    image_quality="low",   # downscale to <=512px, JPEG q60 -- ~85 tokens flat
+)
+
+agent = Agent(
+    llm=OpenAIChatModel(model="gpt-4o"),
+    middleware=[middleware],
+)
+result = agent.invoke("Click the 'Submit' button on screen.")
+```
+
+`files=` also accepts a callable that returns a path (or list of paths) for
+dynamic/per-iteration file names, and non-image files are passed through
+unmodified:
+
+```python
+middleware = PreIterationMiddleware(
+    files=lambda iteration: f"/tmp/screen_{iteration}.png",
+)
+```
+
+`image_quality` options: `"auto"` (default, no change), `"high"` (no
+resize, `detail="high"`), `"medium"` (≤768px, JPEG q70), `"low"` (≤512px,
+JPEG q60), or an `int` 1–100 (JPEG quality directly). Resizing requires
+Pillow: `pip install 'autourgos-agent[images]'` — without it, only the
+`detail=` hint is applied (still saves tokens on the OpenAI side) and the
+original image is sent unresized.
+
+Run multiple callbacks with `SEQUENTIAL` (one after another) or `PARALLEL`
+(concurrently — sync callbacks in a thread pool, async ones as asyncio
+tasks):
+
+```python
+from autourgos_agent import PreIterationMiddleware, SEQUENTIAL, PARALLEL
+
+def log_step(iteration: int) -> None:
+    print(f"Iteration {iteration} starting")
+
+async def refresh_cache(iteration: int) -> None:
+    await cache.refresh()
+
+middleware = PreIterationMiddleware(
+    callback=SEQUENTIAL[capture, log_step],       # capture, then log, in order
+    # or: callback=PARALLEL[capture, refresh_cache],  # both at once
+    files=SCREENSHOT,
+)
+```
+
+Callbacks can be sync or async and are run safely from both `invoke()` and
+`ainvoke()`. A callback that raises is logged (at `ERROR`) and does not
+stop the agent run.
+
+---
+
+## Run History
+
+`history=` records every run to a Markdown + JSON file pair on disk —
+thoughts, tool calls, observations, and the final answer — written
+directly by the agent loop (not middleware), with secret-shaped values
+(API keys, bearer tokens, JWTs, ...) automatically redacted before writing.
+
+```python
+agent = Agent(
+    llm=OpenAIChatModel(model="gpt-4o"),
+    history="./agent_runs",   # folder is created if it doesn't exist
+)
+agent.add_tools(search_tool)
+
+result = agent.invoke("Research the latest AI news.")
+# writes ./agent_runs/Task_<timestamp>_<uid>.md and .json
+```
+
+The Markdown file is a human-readable transcript of the run (thought/action/
+observation trace plus the final answer); the JSON file is the same data in
+a structured form for programmatic use. `history=None` (the default)
+disables recording entirely — no files are written.
 
 ---
 
@@ -1138,11 +1358,16 @@ result = agent.invoke("What is the P/E ratio of Apple?")
 | `middleware` | `list[CallbackHandler]` | `None` | Event hooks for lifecycle events |
 | `max_consecutive_parse_errors` | `int` | `3` | Stop after this many back-to-back JSON parse failures |
 | `tools` | `list[dict]` | `None` | Initial tool list (more can be added with `add_tools()`) |
+| `toolbox` | `list[Toolbox]` | `None` | Toolboxes to lazy-load — hidden from the prompt until `expose_toolbox()`/`expose_tool()` is called. See [Toolboxes](#toolboxes-lazy-loaded-tool-groups) |
 | `system_prompt` | `str` | `""` | Extra system-level instruction added to every prompt |
 | `tool_calling_mode` | `"prompt"` \| `"native"` | `"prompt"` | `"prompt"`: the original JSON-in-text agent loop. `"native"`: uses the LLM's `invoke_with_tools()`/`ainvoke_with_tools()` — structured tool calls straight from the API, no JSON parsing, and multiple tool calls in one turn run concurrently. See [Native Tool Calling](#native-tool-calling) |
 | `max_scratchpad_chars` | `int` | `None` (class default 15,000) | Per-instance override of the scratchpad trim cap; also the built-in summarizer's char threshold when `summarize_every` is set. See [Scratchpad Size Limits](#scratchpad-size-limits) |
 | `summarize_every` | `int` | `None` | Enables built-in scratchpad summarization every N iterations, using this agent's own `llm` (or `summarizer_llm`, if given). See [Auto-Summarizing Scratchpad](#auto-summarizing-scratchpad) |
 | `summarizer_llm` | any with `.invoke()` | `None` | Dedicated LLM the built-in summarizer uses instead of this agent's own `llm`. Only takes effect when `summarize_every` is also set |
+| `max_tool_output_chars` | `int` | `None` (class default 5,000) | Per-instance override of the max characters kept from a single tool's result before truncating with `"... [truncated]"` |
+| `max_tool_workers` | `int` | `None` (class default 8) | Per-instance override of the thread-pool size `invoke()` uses to run parallel tool calls. See [Parallel Tool Calls](#parallel-tool-calls) |
+| `on_agent_start` | `callable` | `None` | `fn(query)` (or `fn(query, agent=self)`) run every time this agent starts, without writing a full `CallbackHandler`. See [`on_agent_start` Shortcut](#on_agent_start-shortcut) |
+| `history` | `str` | `None` | Folder path — records every run to a Markdown + JSON file pair, with secrets redacted. See [Run History](#run-history) |
 
 ---
 

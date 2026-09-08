@@ -18,9 +18,26 @@ Quick start::
     agent.add_tools(search)
     result = agent.invoke("What is the latest news about AI?")
     print(result)
+
+Lazy-loaded toolboxes::
+
+    from autourgos_core import tool, Toolbox
+
+    @tool
+    def web_search(query: str) -> str:
+        ...
+
+    web = Toolbox(name="web", description="Web search and page scraping tools.",
+                   tools=[web_search, scrape_url])
+
+    agent = Agent(llm=OpenAIChatModel(model="gpt-4o"), toolbox=[web])
 """
 
+from autourgos_core import Toolbox
+
 from .agent   import Agent
+from ._toolbox import ToolboxMiddleware
+from ._preiteration import PARALLEL, SEQUENTIAL, PreIterationMiddleware, is_async_callable
 from .base    import (
     BaseLLM,
     BaseAgent,
@@ -86,4 +103,12 @@ __all__ = [
     # tool decorator
     "tool",
     "Tool",
+    # native toolbox support (Agent(toolbox=[...]))
+    "Toolbox",
+    "ToolboxMiddleware",
+    # pre-iteration middleware
+    "PreIterationMiddleware",
+    "SEQUENTIAL",
+    "PARALLEL",
+    "is_async_callable",
 ]

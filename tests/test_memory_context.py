@@ -133,3 +133,84 @@ def test_memory_context_reaches_native_mode_messages():
 
     sent_messages = llm2.calls[0]["prompt"]
     assert any("Paris" in str(m.get("content", "")) for m in sent_messages)
+
+
+class _HugeFormatForLlmMemory:
+    """Regression fixture for Finding #7: format_for_llm() returns a huge
+    blob (bigger than any reasonable scratchpad budget) with no way for the
+    memory object itself to bound it -- exercises the agent-side trim."""
+
+    def add_user_message(self, content: str) -> None:
+        pass
+
+    def add_agent_message(self, content: str) -> None:
+        pass
+
+    def format_for_llm(self, query=None) -> str:
+        return "OLDMEMORY" + ("x" * 5000) + "RECENTMEMORY"
+
+
+def test_huge_memory_context_is_bounded_in_prompt_mode():
+    """
+    Regression for Finding #7: memory_context used to be baked into the
+    rendered prompt with no size limit at all, unlike the scratchpad (which
+    _trim_scratchpad already bounded). A memory backend returning a huge
+    format_for_llm() blob could blow the context window even with
+    max_scratchpad_chars set, since that setting only ever capped the
+    scratchpad, not memory.
+    """
+    memory = _HugeFormatForLlmMemory()
+    agent = make_test_agent(
+        responses=[_final("hi")], memory=memory, max_scratchpad_chars=500,
+    )
+    agent.invoke("hello")
+
+    prompt_sent = str(agent.llm.calls[0]["prompt"])
+    assert len(prompt_sent) < 5012 + 100  # sanity: didn't just pass the whole blob through
+    assert "RECENTMEMORY" in prompt_sent  # tail (most recent) survives the trim
+    assert "OLDMEMORY" not in prompt_sent  # head (oldest) is what gets trimmed
+
+
+def test_huge_memory_context_is_bounded_in_native_mode():
+    memory = _HugeFormatForLlmMemory()
+    llm = ScriptedToolCallLLM([ScriptedToolCallLLM.final("hi")])
+    agent = Agent(llm=llm, tool_calling_mode="native", memory=memory, max_scratchpad_chars=500)
+    agent.add_tools({"name": "noop", "description": "no-op", "parameters": {}, "func": lambda: "ok"})
+    agent.invoke("hello")
+
+    sent_messages = llm.calls[0]["prompt"]
+    combined = json.dumps(sent_messages, default=str)
+    assert "RECENTMEMORY" in combined
+    assert "OLDMEMORY" not in combined
+
+
+def test_native_mode_final_call_messages_respect_combined_budget():
+    """
+    Regression for Finding #7: _trim_native_messages used to size the turns
+    budget against the FULL max_scratchpad_chars, then the caller prepended
+    system_prompt + memory_context on top afterward, uncounted -- the real
+    final call_messages sent to the model could exceed max_scratchpad_chars
+    by however large system_prompt/memory_context were. Now the turns
+    budget is reduced by the system messages' size first, so the combined
+    total (system_messages + trimmed turns) stays within budget.
+    """
+    memory = _HugeFormatForLlmMemory()
+    llm = ScriptedToolCallLLM([
+        ScriptedToolCallLLM.tool_call("noop", {}),
+        ScriptedToolCallLLM.tool_call("noop", {}),
+        ScriptedToolCallLLM.tool_call("noop", {}),
+        ScriptedToolCallLLM.final("hi"),
+    ])
+    agent = Agent(
+        llm=llm, tool_calling_mode="native", memory=memory,
+        max_scratchpad_chars=600, system_prompt="You are a helpful assistant.",
+    )
+    agent.add_tools({"name": "noop", "description": "no-op", "parameters": {}, "func": lambda: "ok" * 50})
+    agent.invoke("hello")
+
+    last_call_messages = llm.calls[-1]["prompt"]
+    total_chars = len(json.dumps(last_call_messages, default=str))
+    # Some slack for the trim markers themselves (see _trim_text_to_budget's
+    # docstring: char cap alone can slightly exceed max_chars by the marker
+    # length) -- this asserts it's coordinated, not that it's byte-exact.
+    assert total_chars < 600 * 2

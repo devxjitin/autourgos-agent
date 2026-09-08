@@ -88,19 +88,33 @@ def test_sync_hook_contextvar_write_visible_to_later_sync_hook_under_ainvoke() -
     assert handler.seen_on_end == ["run-A"]
 
 
-def test_concurrent_ainvoke_runs_do_not_leak_contextvar_state() -> None:
+def test_concurrent_ainvoke_on_same_instance_raises_instead_of_leaking_state() -> None:
+    """As of Sprint 3 (Finding #3), a second ainvoke() on an Agent instance
+    that already has a run in progress raises AgentAlreadyRunningError
+    instead of running concurrently -- so the contextvar-leak scenario this
+    test used to probe (two concurrent runs sharing one Agent's
+    CallbackManager) can no longer happen through the public API at all.
+    Use a separate Agent instance for concurrent work instead (each gets
+    its own CallbackManager, so there's nothing to leak between them)."""
+    from autourgos_agent import AgentAlreadyRunningError
+
     handler = ContextVarHandler()
     agent = Agent(llm=FakeLLM(), middleware=[handler])
 
-    async def _main() -> None:
-        await asyncio.gather(
+    async def _main_collecting() -> List[Any]:
+        return await asyncio.gather(
             agent.ainvoke("run-A"),
             agent.ainvoke("run-B"),
+            return_exceptions=True,
         )
 
-    asyncio.run(_main())
+    outcomes = asyncio.run(_main_collecting())
+    errors = [o for o in outcomes if isinstance(o, BaseException)]
+    successes = [o for o in outcomes if not isinstance(o, BaseException)]
 
-    assert sorted(handler.seen_on_end) == ["run-A", "run-B"]
+    assert len(errors) == 1
+    assert isinstance(errors[0], AgentAlreadyRunningError)
+    assert len(successes) == 1
 
 
 def test_contextvar_write_visible_across_concurrent_tool_hook_fanout() -> None:

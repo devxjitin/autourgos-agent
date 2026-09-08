@@ -59,10 +59,12 @@ This continues until the agent has a final answer or hits the iteration/time lim
 - [Approval Callback](#approval-callback)
 - [Middleware / Callbacks](#middleware--callbacks)
   - [Middleware Integration Contract](#middleware-integration-contract)
+- [Pause & Resume](#pause--resume)
 - [Testing](#testing)
 - [Context Manager](#context-manager)
 - [Time and Iteration Limits](#time-and-iteration-limits)
 - [Scratchpad Size Limits](#scratchpad-size-limits)
+  - [Auto-Summarizing Scratchpad](#auto-summarizing-scratchpad)
 - [LLM Call Retries](#llm-call-retries)
 - [Custom System Prompt](#custom-system-prompt)
 - [Constructor Reference](#constructor-reference)
@@ -712,16 +714,18 @@ produced the line, e.g.:
 
 Use `getattr(agent, "logger", None)` (not a direct import of `AgentLogger`) so your
 middleware doesn't crash if it's ever attached to something other than a `Agent`,
-and does nothing when `verbose=False`. The Autourgos middleware packages
-(autourgos-toolbox, autourgos-summarizer, autourgos-hcix, autourgos-preiteration) use
+and does nothing when `verbose=False`. The built-in summarizer (see
+[Auto-Summarizing Scratchpad](#auto-summarizing-scratchpad) — implemented
+inline, not as middleware, but narrates the same way) and the Autourgos
+middleware packages (autourgos-toolbox, autourgos-hcix, autourgos-preiteration) use
 this same pattern to narrate their own actions.
 
 ### Middleware Integration Contract
 
 These are the three pieces of surface area sibling middleware packages
-(autourgos-hcix, autourgos-summarizer, autourgos-preiteration,
-autourgos-toolbox, and anything else you write) can rely on. This is the
-official, stable contract — treat it as public API.
+(autourgos-hcix, autourgos-preiteration, autourgos-toolbox, and anything
+else you write) can rely on. This is the official, stable contract — treat
+it as public API.
 
 **`agent.scratchpad` (str)**
 A real, live instance attribute, not just a local loop variable. It is
@@ -793,6 +797,62 @@ class RemoteAudit(CallbackHandler):
 
 You don't need to pick one style for a whole handler — different hooks on
 the same class can mix sync and async freely.
+
+---
+
+## Pause & Resume
+
+`agent.pause(reason=None)` / `agent.resume()` / `agent.is_paused` give you
+an in-process, thread-safe way to pause a running agent and later hand
+control back to it — the run blocks at its next **iteration boundary**
+(before the next LLM call, never mid-tool-call or mid-LLM-call) until
+`resume()` is called. Works from both `invoke()` and `ainvoke()`, and in
+both `tool_calling_mode="prompt"` and `"native"`.
+
+```python
+agent = Agent(llm=my_llm)
+
+# From another thread (or another asyncio task):
+agent.pause(reason="waiting for human review")
+...
+agent.resume()
+```
+
+- **Call `pause()`/`resume()` from any thread** — they don't have to be
+  called from the thread running `invoke()`/`ainvoke()`.
+- **Calling `pause()` before `invoke()`/`ainvoke()` starts** means that run
+  begins already paused — it blocks before its first iteration. This is a
+  valid way to start an agent pre-paused, not a bug.
+- **`resume()` without a prior `pause()` is a no-op.**
+- **`max_execution_time` excludes time spent paused** — pausing an agent
+  (e.g. to wait for a human) never counts against its execution-time
+  budget.
+- A middleware hook can pause the agent it's attached to just as easily as
+  external code:
+
+```python
+class PauseForApproval(CallbackHandler):
+    def on_iteration_start(self, iteration, agent=None, **kwargs):
+        if needs_human_review(agent):
+            agent.pause(reason="needs review")
+```
+
+Two new `CallbackHandler` hooks narrate pause/resume to middleware:
+
+```python
+class PauseLogger(CallbackHandler):
+    def on_agent_pause(self, iteration, reason, agent=None, **kwargs):
+        print(f"Paused at iteration {iteration}: {reason}")
+
+    def on_agent_resume(self, iteration, paused_duration, agent=None, **kwargs):
+        print(f"Resumed after {paused_duration:.1f}s")
+```
+
+Out of scope for this feature (deliberately): resuming a paused run in a
+*different* process or after the original one has exited — this is an
+in-process mechanism, not a serialized/checkpointed one. Pausing mid-tool-call
+is also not supported — a pause only ever takes effect at the next
+iteration boundary.
 
 ---
 
@@ -950,6 +1010,54 @@ agent = Agent(
 `max_scratchpad_tokens=None` (the default) disables the token-based check —
 only the character cap applies, matching prior behavior.
 
+### Auto-Summarizing Scratchpad
+
+The blunt trim above (drop older steps) throws away content. For long-running
+tool-heavy agents, built-in summarization periodically replaces
+`agent.scratchpad` with an LLM-generated summary instead, preserving key
+findings and tool results while shrinking the token footprint. It's
+implemented inline in the agent loop itself (not as middleware), turned on
+with three `Agent()` constructor kwargs:
+
+```python
+from autourgos_agent import Agent
+
+agent = Agent(llm=my_llm, summarize_every=5, max_scratchpad_chars=8000)
+```
+
+`max_scratchpad_chars` does double duty here — it's both the trim cap
+(`Agent.MAX_SCRATCHPAD_CHARS`) and the summarizer's own char-threshold
+trigger, sharing this one value. `summarize_every=None` (the default) leaves
+summarization disabled entirely, matching prior behavior.
+
+Pass `summarizer_llm=` to use a separate, cheaper/faster model just for
+summarization instead of this agent's own `llm` (ignored if `summarize_every`
+isn't set):
+
+```python
+from autourgos_openaichat import OpenAIChatModel
+
+cheap_llm = OpenAIChatModel(model="gpt-4o-mini")
+agent = Agent(llm=my_llm, summarize_every=5, summarizer_llm=cheap_llm)
+```
+
+Notes:
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `summarize_every` | `int \| None` | `None` | Summarize every N iterations. `None` disables summarization entirely. |
+| `max_scratchpad_chars` | `int` | `15000` | Trim cap; also triggers summarization once the scratchpad exceeds it (when `summarize_every` is set). |
+| `summarizer_llm` | any with `.invoke()` | `None` | Dedicated LLM for summarization; falls back to this agent's own `llm` when omitted. |
+
+- Has no effect in `tool_calling_mode="native"` — `agent.scratchpad` is a
+  human-readable trace only in that mode and isn't sent to the LLM, so
+  summarizing it wouldn't shrink the real context-window budget. Skips,
+  warning once per agent.
+- A concurrent summarization attempt for the same agent (e.g. two overlapping
+  calls somehow racing) skips rather than blocking.
+- On success, narrates via `agent.logger.middleware("Summarizer", ...)` (see
+  [Narrating middleware activity](#narrating-middleware-activity-in-the-verbose-trace)).
+
 ---
 
 ## LLM Call Retries
@@ -1032,6 +1140,9 @@ result = agent.invoke("What is the P/E ratio of Apple?")
 | `tools` | `list[dict]` | `None` | Initial tool list (more can be added with `add_tools()`) |
 | `system_prompt` | `str` | `""` | Extra system-level instruction added to every prompt |
 | `tool_calling_mode` | `"prompt"` \| `"native"` | `"prompt"` | `"prompt"`: the original JSON-in-text agent loop. `"native"`: uses the LLM's `invoke_with_tools()`/`ainvoke_with_tools()` — structured tool calls straight from the API, no JSON parsing, and multiple tool calls in one turn run concurrently. See [Native Tool Calling](#native-tool-calling) |
+| `max_scratchpad_chars` | `int` | `None` (class default 15,000) | Per-instance override of the scratchpad trim cap; also the built-in summarizer's char threshold when `summarize_every` is set. See [Scratchpad Size Limits](#scratchpad-size-limits) |
+| `summarize_every` | `int` | `None` | Enables built-in scratchpad summarization every N iterations, using this agent's own `llm` (or `summarizer_llm`, if given). See [Auto-Summarizing Scratchpad](#auto-summarizing-scratchpad) |
+| `summarizer_llm` | any with `.invoke()` | `None` | Dedicated LLM the built-in summarizer uses instead of this agent's own `llm`. Only takes effect when `summarize_every` is also set |
 
 ---
 

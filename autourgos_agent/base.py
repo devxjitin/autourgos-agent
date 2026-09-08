@@ -15,6 +15,7 @@ import inspect
 import json
 import logging
 import re
+import threading
 import time
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
@@ -23,6 +24,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from autourgos_core import aretry_with_backoff, extract_text as _extract_text_fn, retry_with_backoff
 
+from .history import _NULL_HISTORY
 from .runtime import build_tool_list
 
 _logger = logging.getLogger("autourgos_agent")
@@ -94,6 +96,22 @@ class AgentEmptyResponseError(AgentError):
         )
 
 
+class AgentAlreadyRunningError(AgentError):
+    """Raised when invoke()/ainvoke() is called on an Agent instance that
+    already has a run in progress. An Agent's mid-run state (scratchpad,
+    current_query) is shared, mutable instance state read by middleware
+    during the run -- a second concurrent call on the same instance would
+    silently overwrite it out from under the first. Use a separate Agent
+    instance for concurrent work instead."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "This Agent instance already has a run in progress. "
+            "invoke()/ainvoke() cannot be called concurrently on the same "
+            "instance -- use a separate Agent instance for concurrent work."
+        )
+
+
 # ── Protocols ─────────────────────────────────────────────────────────────────
 
 class CallbackHandler:
@@ -103,8 +121,9 @@ class CallbackHandler:
     Sub-class and override the methods you care about.  Unused methods
     are no-ops so you never have to implement every hook.
 
-    11 hooks total:
+    13 hooks total:
       - on_agent_start, on_agent_end, on_agent_error
+      - on_agent_pause, on_agent_resume
       - on_tool_start, on_tool_end, on_tool_error
       - on_iteration_start, on_before_iteration, on_iteration, on_llm_end
       - on_parse_error
@@ -123,6 +142,19 @@ class CallbackHandler:
         pass
 
     def on_agent_error(self, error: Exception, agent: Any = None, **kwargs: Any) -> None:
+        pass
+
+    def on_agent_pause(self, iteration: int, reason: Optional[str], agent: Any = None, **kwargs: Any) -> None:
+        """Called once, right before the run blocks at an iteration boundary
+        because ``Agent.pause()`` was called (and ``resume()`` hasn't yet).
+        ``reason`` is whatever string was passed to ``pause(reason=...)``,
+        or None. See README's "Pause & Resume" section."""
+        pass
+
+    def on_agent_resume(self, iteration: int, paused_duration: float, agent: Any = None, **kwargs: Any) -> None:
+        """Called once, right after the run unblocks because ``Agent.resume()``
+        was called. ``paused_duration`` is how long (in seconds) this
+        particular pause lasted."""
         pass
 
     def on_tool_start(self, tool_name: str, tool_input: Dict[str, Any], agent: Any = None, **kwargs: Any) -> None:
@@ -149,8 +181,27 @@ class CallbackHandler:
         """
         return None
 
-    def on_iteration(self, iteration: int, thought: Optional[str], agent: Any = None, **kwargs: Any) -> None:
-        pass
+    def on_iteration(
+        self, iteration: int, thought: Optional[str], agent: Any = None, **kwargs: Any
+    ) -> Optional[bool]:
+        """
+        Called once per prompt-mode loop iteration, right after a thought
+        (if any) is parsed from the LLM response and before that response's
+        action batch is dispatched. NOT called in tool_calling_mode="native"
+        (no equivalent point exists there today).
+
+        Return a truthy value to discard this iteration's action batch
+        instead of executing it -- e.g. because this call injected a newer
+        human instruction (HcixInterruptMiddleware) and the reasoning
+        behind those actions is now stale. The loop appends a scratchpad
+        note and moves straight to the next iteration's LLM call, which
+        will see whatever this call injected. When multiple handlers are
+        registered, any single truthy return discards the batch (OR
+        semantics) -- there's no "un-discard" once one handler asks for it.
+        Return None/falsy (the default) for no-op, matching prior behavior
+        where this hook's return value was purely informational.
+        """
+        return None
 
     def on_llm_end(self, response: Any, agent: Any = None, **kwargs: Any) -> None:
         """Called after each LLM call with the extracted response text.
@@ -279,10 +330,13 @@ def _default_token_counter(text: str) -> int:
     return max(1, len(text) // 4)
 
 
-def _trim_to_token_budget(text: str, max_tokens: int, counter: Callable[[str], int]) -> str:
+def _trim_to_token_budget(
+    text: str, max_tokens: int, counter: Callable[[str], int],
+    prefix: str = "[...earlier steps trimmed...]\n",
+) -> str:
     """Binary-search the longest tail of `text` whose token count (per
-    `counter`) fits in `max_tokens` once the "[...earlier steps
-    trimmed...]" prefix is accounted for, and return prefix + that tail.
+    `counter`) fits in `max_tokens` once `prefix` is accounted for, and
+    return prefix + that tail.
 
     Binary search (not a linear scan) because `counter` may be a real
     tokenizer call, not just len() -- O(log n) calls keeps this cheap even
@@ -293,7 +347,6 @@ def _trim_to_token_budget(text: str, max_tokens: int, counter: Callable[[str], i
     the search still converges since it's monotonic enough in practice for
     real tokenizers and for the default char-based approximation.
     """
-    prefix = "[...earlier steps trimmed...]\n"
     prefix_tokens = counter(prefix)
     if prefix_tokens >= max_tokens:
         return prefix
@@ -566,6 +619,12 @@ class CallbackManager:
     def fire_agent_error(self, error: Exception, agent: Any = None, **kw: Any) -> None:
         self._fire("on_agent_error", error, agent=agent, **kw)
 
+    def fire_agent_pause(self, iteration: int, reason: Optional[str], agent: Any = None, **kw: Any) -> None:
+        self._fire("on_agent_pause", iteration, reason, agent=agent, **kw)
+
+    def fire_agent_resume(self, iteration: int, paused_duration: float, agent: Any = None, **kw: Any) -> None:
+        self._fire("on_agent_resume", iteration, paused_duration, agent=agent, **kw)
+
     def fire_tool_start(self, tool_name: str, tool_input: Dict[str, Any], agent: Any = None, **kw: Any) -> None:
         self._fire("on_tool_start", tool_name, tool_input, agent=agent, **kw)
 
@@ -612,8 +671,34 @@ class CallbackManager:
                 merged.update(result)
         return merged
 
-    def fire_iteration(self, iteration: int, thought: Optional[str], agent: Any = None, **kw: Any) -> None:
-        self._fire("on_iteration", iteration, thought, agent=agent, **kw)
+    def fire_iteration(self, iteration: int, thought: Optional[str], agent: Any = None, **kw: Any) -> bool:
+        """
+        Calls on_iteration on every handler. Returns True if ANY handler
+        signals (via a truthy return) that this iteration's action batch
+        should be discarded instead of dispatched; False if none do,
+        matching prior behavior (a notification-only hook whose return
+        value was always ignored).
+        """
+        discard = False
+        for h in self._handlers:
+            fn = getattr(h, "on_iteration", None)
+            if not callable(fn):
+                continue
+            try:
+                if inspect.iscoroutinefunction(fn):
+                    result = asyncio.run(self._call_with_agent_fallback(fn, iteration, thought, agent=agent, **kw))
+                else:
+                    result = self._call_with_agent_fallback(fn, iteration, thought, agent=agent, **kw)
+            except Exception:
+                _logger.warning(
+                    "Callback handler %s raised in on_iteration",
+                    type(h).__name__,
+                    exc_info=True,
+                )
+                continue
+            if result:
+                discard = True
+        return discard
 
     def fire_llm_end(self, response: Any, agent: Any = None, **kw: Any) -> None:
         self._fire("on_llm_end", response, agent=agent, **kw)
@@ -632,6 +717,12 @@ class CallbackManager:
 
     async def afire_agent_error(self, error: Exception, agent: Any = None, **kw: Any) -> None:
         await self._afire("on_agent_error", error, agent=agent, **kw)
+
+    async def afire_agent_pause(self, iteration: int, reason: Optional[str], agent: Any = None, **kw: Any) -> None:
+        await self._afire("on_agent_pause", iteration, reason, agent=agent, **kw)
+
+    async def afire_agent_resume(self, iteration: int, paused_duration: float, agent: Any = None, **kw: Any) -> None:
+        await self._afire("on_agent_resume", iteration, paused_duration, agent=agent, **kw)
 
     async def afire_tool_start(self, tool_name: str, tool_input: Dict[str, Any], agent: Any = None, **kw: Any) -> None:
         await self._afire("on_tool_start", tool_name, tool_input, agent=agent, **kw)
@@ -695,8 +786,43 @@ class CallbackManager:
                 merged.update(result)
         return merged
 
-    async def afire_iteration(self, iteration: int, thought: Optional[str], agent: Any = None, **kw: Any) -> None:
-        await self._afire("on_iteration", iteration, thought, agent=agent, **kw)
+    async def afire_iteration(self, iteration: int, thought: Optional[str], agent: Any = None, **kw: Any) -> bool:
+        """Async twin of fire_iteration -- same discard-signal aggregation,
+        but a sync handler's on_iteration runs off-thread (reusing this
+        run's captured Context, see _afire's identical comment) and an
+        async one is awaited directly, instead of always blocking the
+        event loop."""
+        discard = False
+        for h in self._handlers:
+            fn = getattr(h, "on_iteration", None)
+            if not callable(fn):
+                continue
+            try:
+                if inspect.iscoroutinefunction(fn):
+                    result = await self._call_with_agent_fallback(fn, iteration, thought, agent=agent, **kw)
+                else:
+                    loop = asyncio.get_running_loop()
+                    run_ctx = self._run_context_var.get()
+                    if run_ctx is not None:
+                        result = await loop.run_in_executor(
+                            self._get_hook_executor(),
+                            lambda: run_ctx.run(self._call_with_agent_fallback, fn, iteration, thought, agent=agent, **kw),
+                        )
+                    else:
+                        result = await loop.run_in_executor(
+                            self._get_hook_executor(),
+                            lambda: self._call_with_agent_fallback(fn, iteration, thought, agent=agent, **kw),
+                        )
+            except Exception:
+                _logger.warning(
+                    "Callback handler %s raised in on_iteration",
+                    type(h).__name__,
+                    exc_info=True,
+                )
+                continue
+            if result:
+                discard = True
+        return discard
 
     async def afire_llm_end(self, response: Any, agent: Any = None, **kw: Any) -> None:
         await self._afire("on_llm_end", response, agent=agent, **kw)
@@ -734,6 +860,27 @@ class BaseLLM(ABC):
         return await loop.run_in_executor(None, lambda: self.invoke(prompt, **kwargs))
 
 
+# ── built-in scratchpad summarization (Agent(summarize_every=...)) ─────────────
+# Inline in the loop, not a CallbackHandler/middleware -- see
+# AgentLoopMixin._maybe_summarize/_amaybe_summarize below.
+
+_SUMMARIZE_PROMPT = (
+    "You are a context compressor. Summarize the following agent scratchpad into a concise summary "
+    "that preserves ALL key findings, tool results, and important observations. Remove redundant "
+    "reasoning steps but keep critical data points and intermediate results.\n\n"
+    "Original task: {query}\n"
+    "Steps completed: {iteration}\n\n"
+    "--- SCRATCHPAD TO SUMMARIZE ---\n"
+    "{scratchpad}\n"
+    "--- END ---\n\n"
+    "Provide a concise summary in this format:\n"
+    "[Summary of steps 1-{iteration}]\n"
+    "Key findings: ...\n"
+    "Tool results: ...\n"
+    "Current status: ...\n"
+)
+
+
 # ── AgentLoopMixin ─────────────────────────────────────────────────────────────
 
 class AgentLoopMixin:
@@ -762,6 +909,15 @@ class AgentLoopMixin:
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
+    def _elapsed_excluding_pauses(self, start_time: float) -> float:
+        """Wall-clock time since start_time, minus any time this run has
+        spent blocked in pause() (see _maybe_pause/_amaybe_pause) -- so
+        pausing an agent (e.g. for human input) never counts against
+        max_execution_time, matching the same total_paused_time exclusion
+        autourgos-hcix's CognitiveInterruptManager already does for its own
+        interrupt flow."""
+        return time.monotonic() - start_time - getattr(self, "_paused_duration", 0.0)
+
     def _check_deadline(self, start_time: float, max_exec_time: Optional[float]) -> None:
         """Raise AgentTimeoutError if the run's absolute deadline has already
         passed. Called both at the top of each iteration (existing behavior)
@@ -772,7 +928,7 @@ class AgentLoopMixin:
         ever caught one full iteration later, letting the run overrun its
         declared limit by an arbitrary amount.
         """
-        if max_exec_time and (time.monotonic() - start_time) > max_exec_time:
+        if max_exec_time and self._elapsed_excluding_pauses(start_time) > max_exec_time:
             raise AgentTimeoutError(max_exec_time)
 
     def _inject_agent_deadline(
@@ -791,8 +947,148 @@ class AgentLoopMixin:
         """
         if not max_exec_time or not getattr(self.llm, "SUPPORTS_AGENT_DEADLINE", False):
             return call_kwargs
-        remaining = max_exec_time - (time.monotonic() - start_time)
+        remaining = max_exec_time - self._elapsed_excluding_pauses(start_time)
         return {**call_kwargs, "_agent_deadline_seconds": remaining}
+
+    def _maybe_pause(self, iteration: int, cb: "CallbackManager") -> None:
+        """Block the current SYNC run at this iteration boundary if
+        Agent.pause() has been called and resume() hasn't yet. A no-op
+        (returns immediately) when not paused -- the common case, checked
+        with a single non-blocking Event.is_set() read. See Agent.pause()/
+        resume()/is_paused and README's "Pause & Resume" section."""
+        if self._resume_event.is_set():
+            return
+        reason = self._pause_reason
+        cb.fire_agent_pause(iteration, reason, agent=self)
+        pause_start = time.monotonic()
+        self._resume_event.wait()
+        paused_for = time.monotonic() - pause_start
+        self._paused_duration += paused_for
+        cb.fire_agent_resume(iteration, paused_for, agent=self)
+
+    async def _amaybe_pause(self, iteration: int, cb: "CallbackManager") -> None:
+        """Async twin of _maybe_pause. Offloads the blocking
+        threading.Event.wait() to a worker thread (via run_in_executor)
+        instead of blocking the event loop -- the same Event serves both
+        the sync and async loops since pause()/resume() must be safely
+        callable from any thread, not necessarily the one running
+        invoke()/ainvoke(), and threading.Event's set()/clear()/wait() are
+        all thread-safe by construction."""
+        if self._resume_event.is_set():
+            return
+        reason = self._pause_reason
+        await cb.afire_agent_pause(iteration, reason, agent=self)
+        pause_start = time.monotonic()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._resume_event.wait)
+        paused_for = time.monotonic() - pause_start
+        self._paused_duration += paused_for
+        await cb.afire_agent_resume(iteration, paused_for, agent=self)
+
+    def _summarize_should_trigger(self, iteration: int) -> bool:
+        """Cheap (no lock, no LLM call) check: should _do_summarize run for
+        this iteration? See Agent(summarize_every=...)."""
+        summarize_every = getattr(self, "summarize_every", None)
+        if summarize_every is None or not self.scratchpad:
+            return False
+
+        # tool_calling_mode="native" never feeds self.scratchpad back to the
+        # LLM -- it's kept up to date purely as a human-readable trace (see
+        # the native loops' comments); the real conversation state is an
+        # internal message list this has no access to. Summarizing
+        # scratchpad in that mode would silently burn a real LLM call
+        # compressing text the model never sees, with zero effect on the
+        # actual context-window budget. Warned once, not skipped silently.
+        if getattr(self, "tool_calling_mode", "prompt") == "native":
+            if not self._warned_native_summarize:
+                self._warned_native_summarize = True
+                _logger.warning(
+                    "Agent(summarize_every=...): tool_calling_mode is 'native' -- "
+                    "agent.scratchpad is not sent to the LLM in native mode, so "
+                    "summarizing it has no effect on the actual context-window "
+                    "budget. Skipping summarization for this agent."
+                )
+            return False
+
+        max_chars = getattr(self, "MAX_SCRATCHPAD_CHARS", 15_000)
+        current_length = len(self.scratchpad)
+        if summarize_every and iteration % summarize_every == 0:
+            return True
+        if current_length > max_chars:
+            # Only re-trigger the char-threshold check if the scratchpad has
+            # actually grown since the last summarization -- otherwise a
+            # summary that itself stays over max_chars (small threshold, or
+            # a verbose summarization LLM) would re-trigger summarization
+            # every single iteration even with no new content to compress.
+            last_length = self._last_summarized_length
+            if last_length is None or current_length > last_length:
+                return True
+        return False
+
+    def _do_summarize(self, iteration: int) -> None:
+        """Actually run summarization for this iteration -- acquires
+        _summarizer_lock (non-blocking; a concurrent call for the same
+        agent just skips rather than waiting, matching the old middleware's
+        behavior), calls the LLM, and writes the result back onto
+        self.scratchpad. Call only after _summarize_should_trigger()."""
+        if not self._summarizer_lock.acquire(blocking=False):
+            _logger.debug("Agent(summarize_every=...): summarization already in progress, skipping.")
+            return
+        try:
+            llm = getattr(self, "summarizer_llm", None) or getattr(self, "llm", None)
+            if llm is None:
+                _logger.warning("Agent(summarize_every=...): no LLM available. Skipping.")
+                return
+
+            original_length = len(self.scratchpad)
+            _logger.info(
+                f"Triggering auto-summarization at iteration {iteration} "
+                f"(scratchpad length: {original_length})."
+            )
+            prompt = _SUMMARIZE_PROMPT.format(
+                query=self.current_query,
+                iteration=iteration,
+                scratchpad=self.scratchpad,
+            )
+            try:
+                summary = llm.invoke(prompt)
+                if hasattr(summary, "content"):
+                    summary = summary.content
+                summary = str(summary).strip()
+                if summary:
+                    self.scratchpad = f"[Summarized up to step {iteration}]\n{summary}"
+                    self._last_summarized_length = len(self.scratchpad)
+                    _logger.info("Agent(summarize_every=...): scratchpad compressed successfully.")
+                    logger = getattr(self, "logger", None)
+                    if logger:
+                        logger.middleware(
+                            "Summarizer",
+                            f"Compressed scratchpad (iteration {iteration}, was {original_length} chars).",
+                        )
+                else:
+                    _logger.warning(
+                        f"Agent(summarize_every=...): summarization LLM returned an empty "
+                        f"summary at iteration {iteration}; leaving scratchpad unchanged."
+                    )
+            except Exception as exc:
+                _logger.warning(f"Agent(summarize_every=...): summarization failed: {exc}")
+        finally:
+            self._summarizer_lock.release()
+
+    def _maybe_summarize(self, iteration: int) -> None:
+        """Sync entry point -- see Agent(summarize_every=...)."""
+        if self._summarize_should_trigger(iteration):
+            self._do_summarize(iteration)
+
+    async def _amaybe_summarize(self, iteration: int) -> None:
+        """Async twin of _maybe_summarize. Offloads the blocking LLM call
+        to a worker thread (via run_in_executor) instead of blocking the
+        event loop, matching how the old middleware's sync hook was
+        offloaded when fired from the async loop."""
+        if not self._summarize_should_trigger(iteration):
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._do_summarize, iteration)
 
     def _build_messages(self, prompt_text: str) -> Any:
         """Wrap the rendered prompt in messages list if a system prompt exists."""
@@ -898,6 +1194,7 @@ class AgentLoopMixin:
             cb: CallbackManager = getattr(self, "callback_manager", None)
             if cb:
                 cb.fire_tool_error(tool_name, exc, agent=self)
+            getattr(self, "_history", _NULL_HISTORY).record_tool_error(tool_name, exc)
             result = f"Error executing '{tool_name}': {exc}"
 
         if len(result) > max_chars:
@@ -905,8 +1202,18 @@ class AgentLoopMixin:
 
         return result
 
-    async def _execute_tool_async(self, tool_map: Dict[str, Any], tool_name: str, tool_input: Any) -> str:
-        """Async version of _execute_tool — awaits coroutine funcs if needed."""
+    async def _execute_tool_async(
+        self, tool_map: Dict[str, Any], tool_name: str, tool_input: Any,
+        pool: Optional[ThreadPoolExecutor] = None,
+    ) -> str:
+        """Async version of _execute_tool — awaits coroutine funcs directly;
+        dispatches a plain sync func to `pool` (via run_in_executor) instead
+        of calling it inline, so a blocking tool doesn't stall the event
+        loop for every other concurrently-running task/iteration. `pool` is
+        the run's shared, MAX_TOOL_WORKERS-bounded executor (see _arun_loop /
+        _arun_loop_native) -- when omitted (e.g. direct unit-test calls),
+        falls back to the loop's default executor, same as calling with no
+        pool ever did implicitly."""
         max_chars: int = getattr(self, "MAX_TOOL_OUTPUT_CHARS", 5000)
 
         if tool_name not in tool_map:
@@ -924,10 +1231,17 @@ class AgentLoopMixin:
                 return validation_error
 
         try:
-            if isinstance(tool_input, dict):
-                raw_result = func(**tool_input)
+            if inspect.iscoroutinefunction(func):
+                if isinstance(tool_input, dict):
+                    raw_result = await func(**tool_input)
+                else:
+                    raw_result = await func(tool_input)
             else:
-                raw_result = func(tool_input)
+                loop = asyncio.get_running_loop()
+                if isinstance(tool_input, dict):
+                    raw_result = await loop.run_in_executor(pool, lambda: func(**tool_input))
+                else:
+                    raw_result = await loop.run_in_executor(pool, func, tool_input)
 
             if inspect.isawaitable(raw_result):
                 raw_result = await raw_result
@@ -937,6 +1251,7 @@ class AgentLoopMixin:
             cb: CallbackManager = getattr(self, "callback_manager", None)
             if cb:
                 await cb.afire_tool_error(tool_name, exc, agent=self)
+            getattr(self, "_history", _NULL_HISTORY).record_tool_error(tool_name, exc)
             result = f"Error executing '{tool_name}': {exc}"
 
         if len(result) > max_chars:
@@ -1016,49 +1331,86 @@ class AgentLoopMixin:
             cb: CallbackManager = getattr(self, "callback_manager", None)
             if cb:
                 cb.fire_tool_error(tool_name, TimeoutError(result), agent=self)
+            getattr(self, "_history", _NULL_HISTORY).record_tool_error(tool_name, TimeoutError(result))
             return result
 
     async def _execute_tool_async_with_timeout(
-        self, tool_map: Dict[str, Any], tool_name: str, tool_input: Any, timeout: Optional[float]
+        self, tool_map: Dict[str, Any], tool_name: str, tool_input: Any, timeout: Optional[float],
+        pool: Optional[ThreadPoolExecutor] = None,
     ) -> str:
         """Async twin of _collect_future_result -- wraps _execute_tool_async in
         asyncio.wait_for so a hung async tool doesn't block the loop forever.
         For a genuinely async tool func, wait_for can actually cancel it at
-        its next await point; for a blocking sync tool func, this can only
-        raise once the underlying call returns (asyncio can't preempt a
-        running sync frame), same fundamental limit as anywhere else a sync
-        function runs inside an event loop.
+        its next await point; for a sync tool func running in `pool`
+        (see _execute_tool_async), the wait_for timeout still fires on
+        schedule since waiting on the executor future doesn't block the
+        loop, but the underlying worker thread itself is not interrupted --
+        same abandon-in-place handling as the sync path's _collect_future_result.
         """
         try:
             return await asyncio.wait_for(
-                self._execute_tool_async(tool_map, tool_name, tool_input), timeout=timeout
+                self._execute_tool_async(tool_map, tool_name, tool_input, pool=pool), timeout=timeout
             )
         except asyncio.TimeoutError:
             result = f"Error: tool '{tool_name}' timed out after {timeout}s."
             cb: CallbackManager = getattr(self, "callback_manager", None)
             if cb:
                 await cb.afire_tool_error(tool_name, TimeoutError(result), agent=self)
+            getattr(self, "_history", _NULL_HISTORY).record_tool_error(tool_name, TimeoutError(result))
             return result
 
-    def _trim_scratchpad(self, scratchpad: str) -> str:
-        """Trim the scratchpad to fit both the character cap (MAX_SCRATCHPAD_CHARS,
+    def _trim_text_to_budget(self, text: str, marker: str = "[...earlier steps trimmed...]\n") -> str:
+        """Trim `text` to fit both the character cap (MAX_SCRATCHPAD_CHARS,
         always active) and, if set, a token budget (max_scratchpad_tokens) --
         char count alone is a poor proxy for what actually overflows an LLM's
         context window, since tokens-per-char varies a lot by language and
         content (dense non-English text or code can run well under 4
         chars/token, silently blowing a char-only budget's whole point).
+
+        Shared by _trim_scratchpad (the prompt-mode scratchpad) and the
+        memory-context trim used by both prompt and native modes, so a
+        memory object's format_for_llm() output is bounded by the same
+        limits instead of being injected into the final prompt/messages
+        completely unbounded (previously the case -- only the scratchpad
+        itself was ever capped here).
         """
         max_chars: int = getattr(self, "MAX_SCRATCHPAD_CHARS", 15000)
-        if len(scratchpad) > max_chars:
-            scratchpad = "[...earlier steps trimmed...]\n" + scratchpad[-max_chars:]
+        if len(text) > max_chars:
+            text = marker + text[-max_chars:]
 
         max_tokens: Optional[int] = getattr(self, "max_scratchpad_tokens", None)
         if max_tokens is not None:
             counter: Callable[[str], int] = getattr(self, "token_counter", None) or _default_token_counter
-            if counter(scratchpad) > max_tokens:
-                scratchpad = _trim_to_token_budget(scratchpad, max_tokens, counter)
+            if counter(text) > max_tokens:
+                text = _trim_to_token_budget(text, max_tokens, counter, prefix=marker)
 
-        return scratchpad
+        return text
+
+    def _trim_scratchpad(self, scratchpad: str) -> str:
+        """Trim the scratchpad to the shared context budget. See
+        _trim_text_to_budget for the actual char/token trimming logic."""
+        return self._trim_text_to_budget(scratchpad)
+
+    def _trim_memory_context(self, memory_context: str) -> str:
+        """Trim memory's format_for_llm() output to the same context budget
+        _trim_scratchpad enforces.
+
+        In prompt mode this is capped independently of the scratchpad's own
+        budget usage, not combined into one shared total -- doing so would
+        require restructuring the prompt template's separate
+        {memory_context}/{previous_context} placeholders into one budgeted
+        blob, a larger change than closing the "memory_context is
+        completely unbounded" gap warrants. Worst case here is roughly 2x
+        MAX_SCRATCHPAD_CHARS (scratchpad + memory_context each capped
+        separately) instead of unbounded.
+
+        Native mode does better: _trim_native_messages additionally
+        coordinates this with the turns budget, since there the whole
+        call_messages list is assembled in one place already, so the real
+        combined total (system_messages + trimmed turns) stays within one
+        budget.
+        """
+        return self._trim_text_to_budget(memory_context, marker="[...older memory trimmed...]\n")
 
     # ── sync loop ─────────────────────────────────────────────────────────────
 
@@ -1079,14 +1431,26 @@ class AgentLoopMixin:
         template: str = getattr(self, "prompt_template", "")
         logger = getattr(self, "logger", None)
         cb: CallbackManager = getattr(self, "callback_manager", CallbackManager())
-        memory_context = _get_memory_context(getattr(self, "memory", None), query)
+        memory_context = self._trim_memory_context(_get_memory_context(getattr(self, "memory", None), query))
 
-        for iteration in range(1, max_iterations + 1):
+        # One bounded pool for the whole run, not a fresh one per iteration --
+        # a fresh pool each iteration meant MAX_TOOL_WORKERS only ever capped
+        # that iteration's tool calls, not total in-flight tool threads across
+        # a multi-iteration run with repeated timeouts (each abandoned thread
+        # from a prior iteration's timed-out tool, see _collect_future_result,
+        # kept accumulating alongside brand-new full-size pools). shutdown
+        # happens once, in the finally below, not after every iteration.
+        pool = ThreadPoolExecutor(max_workers=max(1, getattr(self, "MAX_TOOL_WORKERS", 8)))
+        try:
+          for iteration in range(1, max_iterations + 1):
             cb.fire_iteration_start(iteration, agent=self)
+            self._history.begin_iteration(iteration)
+            self._maybe_pause(iteration, cb)
+            self._maybe_summarize(iteration)
             iteration_extra_kwargs = cb.fire_before_iteration(iteration, agent=self)
 
             # time guard
-            if max_exec_time and (time.monotonic() - start_time) > max_exec_time:
+            if max_exec_time and self._elapsed_excluding_pauses(start_time) > max_exec_time:
                 raise AgentTimeoutError(max_exec_time)
 
             # Rebuild from self.tools every iteration (not once before the loop)
@@ -1122,6 +1486,7 @@ class AgentLoopMixin:
             self._check_deadline(start_time, max_exec_time)
 
             cb.fire_llm_end(response_text, agent=self, raw=raw, **self._extract_llm_metadata(raw))
+            self._history.record_thought(response_text)
 
             if logger and getattr(logger, "full_output", False):
                 logger.llm_response(response_text, iteration)
@@ -1132,10 +1497,14 @@ class AgentLoopMixin:
             except Exception:
                 thought, actions, final_answer = None, [], None
 
-            if thought:
-                cb.fire_iteration(iteration, thought, agent=self)
-                if logger:
-                    logger.thought(thought, iteration)
+            # Fired unconditionally (not gated on `if thought:`) -- a
+            # handler (e.g. HcixInterruptMiddleware) needs the chance to
+            # signal "discard this turn's action batch" on every turn that
+            # might dispatch actions, not only turns that also produced a
+            # thought.
+            discard_batch = cb.fire_iteration(iteration, thought, agent=self)
+            if thought and logger:
+                logger.thought(thought, iteration)
 
             # final answer
             if final_answer:
@@ -1143,6 +1512,7 @@ class AgentLoopMixin:
                 if memory:
                     _record_agent_message(memory, final_answer)
                 cb.fire_agent_end(final_answer, agent=self)
+                self._history.finish(final_answer)
                 if logger:
                     logger.final_answer(final_answer)
                 return final_answer
@@ -1173,6 +1543,28 @@ class AgentLoopMixin:
 
             consecutive_parse_errors = 0
 
+            # FRAMEWORK_REVIEW.md Finding #5: a handler that just injected a
+            # newer human instruction (e.g. HcixInterruptMiddleware.on_iteration)
+            # can signal via its return value that the actions this LLM turn
+            # already produced were reasoned out BEFORE that instruction
+            # arrived, and are therefore stale -- discard them unexecuted
+            # rather than dispatching a plan the human has already
+            # superseded, and let the next iteration's LLM call (which will
+            # see the injected override) produce a fresh one. This is
+            # deliberately NOT treated as a parse error (consecutive_parse_errors
+            # is already reset to 0 above): a run that legitimately keeps
+            # getting interrupted must never trip AgentParseError/
+            # AgentMaxIterationsError just for that.
+            if discard_batch:
+                self.scratchpad += (
+                    f"\nStep {iteration}:\n"
+                    f"Thought: {thought or 'None'}\n"
+                    f"Observation: A newer human instruction was received; "
+                    f"the previous action plan was discarded before execution.\n"
+                )
+                self.scratchpad = self._trim_scratchpad(self.scratchpad)
+                continue
+
             # execute tools — the prompt tells the model it can request several
             # independent tool calls in one turn ("You can call multiple tools
             # at once if they don't depend on each other's outputs"), so the
@@ -1190,6 +1582,7 @@ class AgentLoopMixin:
                 if logger:
                     logger.tool_call(tool_name, tool_input, iteration)
                 cb.fire_tool_start(tool_name, tool_input, agent=self)
+                self._history.record_tool_start(tool_name, tool_input)
 
                 # approval gate
                 if approval_callback:
@@ -1200,6 +1593,7 @@ class AgentLoopMixin:
                 if approval_callback and not is_approved:
                     denial_result = "Tool call was denied by the approval callback."
                     cb.fire_tool_end(tool_name, denial_result, agent=self)
+                    self._history.record_tool_result(tool_name, denial_result)
                     step_lines.append(f"Action: {tool_name}({tool_input})")
                     step_lines.append(f"Observation: {denial_result}")
                     continue
@@ -1207,35 +1601,35 @@ class AgentLoopMixin:
                 approved.append((tool_name, tool_input))
 
             if approved:
-                max_workers = min(len(approved), getattr(self, "MAX_TOOL_WORKERS", 8))
-                # Not a `with` block: ThreadPoolExecutor.__exit__ calls
-                # shutdown(wait=True), which blocks until every submitted
-                # thread finishes -- including one _collect_future_result
-                # already gave up on via tool_timeout. shutdown(wait=False)
-                # lets the loop move on immediately; the timed-out thread
-                # (if any) is abandoned to finish on its own, same as
-                # documented on _collect_future_result.
-                pool = ThreadPoolExecutor(max_workers=max_workers)
-                try:
-                    futures = [
-                        (tool_name, tool_input, pool.submit(self._execute_tool, tool_map, tool_name, tool_input))
-                        for tool_name, tool_input in approved
-                    ]
-                    for tool_name, tool_input, future in futures:
-                        result = self._collect_future_result(tool_name, future, tool_timeout)
-                        self._check_deadline(start_time, max_exec_time)
-                        cb.fire_tool_end(tool_name, result, agent=self)
-                        if logger:
-                            logger.tool_result(tool_name, result, iteration)
-                        step_lines.append(f"Action: {tool_name}({tool_input})")
-                        step_lines.append(f"Observation: {result}")
-                finally:
-                    pool.shutdown(wait=False)
+                # Reuses the one pool created for the whole run (see above) --
+                # sized to MAX_TOOL_WORKERS regardless of how many tools this
+                # particular iteration approved, so the cap holds across
+                # iterations, not just within one.
+                futures = [
+                    (tool_name, tool_input, pool.submit(self._execute_tool, tool_map, tool_name, tool_input))
+                    for tool_name, tool_input in approved
+                ]
+                for tool_name, tool_input, future in futures:
+                    result = self._collect_future_result(tool_name, future, tool_timeout)
+                    self._check_deadline(start_time, max_exec_time)
+                    cb.fire_tool_end(tool_name, result, agent=self)
+                    self._history.record_tool_result(tool_name, result)
+                    if logger:
+                        logger.tool_result(tool_name, result, iteration)
+                    step_lines.append(f"Action: {tool_name}({tool_input})")
+                    step_lines.append(f"Observation: {result}")
 
             self.scratchpad += "\n".join(step_lines)
             self.scratchpad = self._trim_scratchpad(self.scratchpad)
 
-        raise AgentMaxIterationsError(max_iterations)
+          raise AgentMaxIterationsError(max_iterations)
+        finally:
+            # Not `with pool:` -- that calls shutdown(wait=True), which would
+            # block here until every submitted thread finishes, including one
+            # _collect_future_result already gave up on via tool_timeout.
+            # wait=False abandons any still-running (timed-out) thread to
+            # finish on its own instead of blocking run teardown on it.
+            pool.shutdown(wait=False)
 
     # ── async loop ────────────────────────────────────────────────────────────
 
@@ -1256,13 +1650,27 @@ class AgentLoopMixin:
         template: str = getattr(self, "prompt_template", "")
         logger = getattr(self, "logger", None)
         cb: CallbackManager = getattr(self, "callback_manager", CallbackManager())
-        memory_context = _get_memory_context(getattr(self, "memory", None), query)
+        memory_context = self._trim_memory_context(_get_memory_context(getattr(self, "memory", None), query))
 
-        for iteration in range(1, max_iterations + 1):
+        # One semaphore for the whole run so MAX_TOOL_WORKERS actually caps
+        # concurrent async tool calls -- previously unenforced here (plain
+        # asyncio.gather with no cap at all), unlike the sync loop above.
+        tool_semaphore = asyncio.Semaphore(max(1, getattr(self, "MAX_TOOL_WORKERS", 8)))
+
+        # Bounded executor a sync tool func is dispatched to (see
+        # _execute_tool_async) instead of running inline on the event loop
+        # thread -- one per run, reused across iterations, shut down in the
+        # finally below regardless of how the run ends.
+        tool_pool = ThreadPoolExecutor(max_workers=max(1, getattr(self, "MAX_TOOL_WORKERS", 8)))
+        try:
+          for iteration in range(1, max_iterations + 1):
             await cb.afire_iteration_start(iteration, agent=self)
+            self._history.begin_iteration(iteration)
+            await self._amaybe_pause(iteration, cb)
+            await self._amaybe_summarize(iteration)
             iteration_extra_kwargs = await cb.afire_before_iteration(iteration, agent=self)
 
-            if max_exec_time and (time.monotonic() - start_time) > max_exec_time:
+            if max_exec_time and self._elapsed_excluding_pauses(start_time) > max_exec_time:
                 raise AgentTimeoutError(max_exec_time)
 
             # See _run_loop's identical comment: rebuilt every iteration so a
@@ -1284,7 +1692,7 @@ class AgentLoopMixin:
             try:
                 acall = self._acall_llm_with_retry(lambda: self.llm.ainvoke(messages, **call_kwargs))  # type: ignore[attr-defined]
                 if max_exec_time:
-                    remaining = max_exec_time - (time.monotonic() - start_time)
+                    remaining = max_exec_time - self._elapsed_excluding_pauses(start_time)
                     if remaining <= 0:
                         raise AgentTimeoutError(max_exec_time)
                     raw = await asyncio.wait_for(acall, timeout=remaining)
@@ -1304,6 +1712,7 @@ class AgentLoopMixin:
             self._check_deadline(start_time, max_exec_time)
 
             await cb.afire_llm_end(response_text, agent=self, raw=raw, **self._extract_llm_metadata(raw))
+            self._history.record_thought(response_text)
 
             if logger and getattr(logger, "full_output", False):
                 logger.llm_response(response_text, iteration)
@@ -1313,16 +1722,18 @@ class AgentLoopMixin:
             except Exception:
                 thought, actions, final_answer = None, [], None
 
-            if thought:
-                await cb.afire_iteration(iteration, thought, agent=self)
-                if logger:
-                    logger.thought(thought, iteration)
+            # See _run_loop's identical comment: fired unconditionally so
+            # the discard signal can apply even on a turn with no thought.
+            discard_batch = await cb.afire_iteration(iteration, thought, agent=self)
+            if thought and logger:
+                logger.thought(thought, iteration)
 
             if final_answer:
                 memory = getattr(self, "memory", None)
                 if memory:
                     _record_agent_message(memory, final_answer)
                 await cb.afire_agent_end(final_answer, agent=self)
+                self._history.finish(final_answer)
                 if logger:
                     logger.final_answer(final_answer)
                 return final_answer
@@ -1347,6 +1758,18 @@ class AgentLoopMixin:
 
             consecutive_parse_errors = 0
 
+            # See _run_loop's identical comment (Finding #5): discard a
+            # stale action batch instead of dispatching it.
+            if discard_batch:
+                self.scratchpad += (
+                    f"\nStep {iteration}:\n"
+                    f"Thought: {thought or 'None'}\n"
+                    f"Observation: A newer human instruction was received; "
+                    f"the previous action plan was discarded before execution.\n"
+                )
+                self.scratchpad = self._trim_scratchpad(self.scratchpad)
+                continue
+
             step_lines: List[str] = [f"\nStep {iteration}:"]
             if thought:
                 step_lines.append(f"Thought: {thought}")
@@ -1359,6 +1782,7 @@ class AgentLoopMixin:
                 if logger:
                     logger.tool_call(tool_name, tool_input, iteration)
                 await cb.afire_tool_start(tool_name, tool_input, agent=self)
+                self._history.record_tool_start(tool_name, tool_input)
 
                 if approval_callback:
                     is_approved = await _maybe_await(approval_callback(tool_name, tool_input))
@@ -1366,6 +1790,7 @@ class AgentLoopMixin:
                     if not is_approved:
                         denial_result = "Tool call was denied by the approval callback."
                         await cb.afire_tool_end(tool_name, denial_result, agent=self)
+                        self._history.record_tool_result(tool_name, denial_result)
                         step_lines.append(f"Action: {tool_name}({tool_input})")
                         step_lines.append(f"Observation: {denial_result}")
                         continue
@@ -1373,13 +1798,20 @@ class AgentLoopMixin:
                 approved.append((tool_name, tool_input))
 
             if approved:
+                async def _run_bounded(tool_name: str, tool_input: Any) -> str:
+                    async with tool_semaphore:
+                        return await self._execute_tool_async_with_timeout(
+                            tool_map, tool_name, tool_input, tool_timeout, pool=tool_pool
+                        )
+
                 results = await asyncio.gather(*[
-                    self._execute_tool_async_with_timeout(tool_map, tool_name, tool_input, tool_timeout)
+                    _run_bounded(tool_name, tool_input)
                     for tool_name, tool_input in approved
                 ])
                 self._check_deadline(start_time, max_exec_time)
                 for (tool_name, tool_input), result in zip(approved, results):
                     await cb.afire_tool_end(tool_name, result, agent=self)
+                    self._history.record_tool_result(tool_name, result)
                     if logger:
                         logger.tool_result(tool_name, result, iteration)
                     step_lines.append(f"Action: {tool_name}({tool_input})")
@@ -1388,7 +1820,9 @@ class AgentLoopMixin:
             self.scratchpad += "\n".join(step_lines)
             self.scratchpad = self._trim_scratchpad(self.scratchpad)
 
-        raise AgentMaxIterationsError(max_iterations)
+          raise AgentMaxIterationsError(max_iterations)
+        finally:
+            tool_pool.shutdown(wait=False)
 
     # ── native tool-calling loop (tool_calling_mode="native") ────────────────
     # Uses the LLM's own invoke_with_tools()/ainvoke_with_tools() -- structured
@@ -1448,7 +1882,9 @@ class AgentLoopMixin:
             turns.append(turn)
         return turns
 
-    def _trim_native_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _trim_native_messages(
+        self, messages: List[Dict[str, Any]], system_messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
         """Keep the native-mode conversation list within the same budget
         _trim_scratchpad enforces for prompt mode (MAX_SCRATCHPAD_CHARS,
         plus max_scratchpad_tokens if set) -- native mode's `messages` list
@@ -1457,6 +1893,15 @@ class AgentLoopMixin:
         whole turns (see _group_native_turns) from the oldest end,
         always keeping the original user query (messages[0]) and at least
         one turn so the conversation never goes fully empty.
+
+        `system_messages` -- the system_prompt + (already independently
+        trimmed) memory_context that the caller will prepend to form the
+        actual `call_messages` sent to the LLM -- is counted against this
+        same budget when given, so the real final total (system_messages +
+        trimmed turns) is coordinated against one budget instead of the
+        turns being trimmed against the full budget while system_messages
+        gets added on top of it uncounted. Falls back to using the whole
+        budget for turns alone if omitted, matching prior behavior.
         """
         if len(messages) <= 1:
             return messages
@@ -1465,17 +1910,22 @@ class AgentLoopMixin:
         max_tokens: Optional[int] = getattr(self, "max_scratchpad_tokens", None)
         counter: Callable[[str], int] = getattr(self, "token_counter", None) or _default_token_counter
 
+        reserved_chars = len(json.dumps(system_messages, default=str)) if system_messages else 0
+        turn_max_chars = max(max_chars - reserved_chars, 0)
+
         head = messages[:1]
         turns = self._group_native_turns(messages)
 
         def _flatten() -> List[Dict[str, Any]]:
             return head + [m for turn in turns for m in turn]
 
-        while len(turns) > 1 and len(json.dumps(_flatten(), default=str)) > max_chars:
+        while len(turns) > 1 and len(json.dumps(_flatten(), default=str)) > turn_max_chars:
             turns.pop(0)
 
         if max_tokens is not None:
-            while len(turns) > 1 and counter(json.dumps(_flatten(), default=str)) > max_tokens:
+            reserved_tokens = counter(json.dumps(system_messages, default=str)) if system_messages else 0
+            turn_max_tokens = max(max_tokens - reserved_tokens, 0)
+            while len(turns) > 1 and counter(json.dumps(_flatten(), default=str)) > turn_max_tokens:
                 turns.pop(0)
 
         return _flatten()
@@ -1547,9 +1997,11 @@ class AgentLoopMixin:
             if logger:
                 logger.tool_call(tc.name, tc.arguments, iteration)
             cb.fire_tool_start(tc.name, tc.arguments, agent=self)
+            self._history.record_tool_start(tc.name, tc.arguments)
             if approval_callback and not _call_sync_approval(approval_callback, tc.name, tc.arguments):
                 result = "Tool call was denied by the approval callback."
                 cb.fire_tool_end(tc.name, result, agent=self)
+                self._history.record_tool_result(tc.name, result)
                 denied.append((tc, result))
             else:
                 approved.append(tc)
@@ -1572,9 +2024,11 @@ class AgentLoopMixin:
             if logger:
                 logger.tool_call(tc.name, tc.arguments, iteration)
             await cb.afire_tool_start(tc.name, tc.arguments, agent=self)
+            self._history.record_tool_start(tc.name, tc.arguments)
             if approval_callback and not await _maybe_await(approval_callback(tc.name, tc.arguments)):
                 result = "Tool call was denied by the approval callback."
                 await cb.afire_tool_end(tc.name, result, agent=self)
+                self._history.record_tool_result(tc.name, result)
                 denied.append((tc, result))
             else:
                 approved.append(tc)
@@ -1597,14 +2051,21 @@ class AgentLoopMixin:
         tool_timeout: Optional[float] = getattr(self, "tool_timeout", None)
         logger = getattr(self, "logger", None)
         cb: CallbackManager = getattr(self, "callback_manager", CallbackManager())
-        memory_context = _get_memory_context(getattr(self, "memory", None), query)
+        memory_context = self._trim_memory_context(_get_memory_context(getattr(self, "memory", None), query))
         messages = self._build_native_messages(query)
 
-        for iteration in range(1, max_iterations + 1):
+        # See _run_loop's identical comment: one bounded pool for the whole
+        # run, reused across iterations, rather than a fresh one each time.
+        pool = ThreadPoolExecutor(max_workers=max(1, getattr(self, "MAX_TOOL_WORKERS", 8)))
+        try:
+          for iteration in range(1, max_iterations + 1):
             cb.fire_iteration_start(iteration, agent=self)
+            self._history.begin_iteration(iteration)
+            self._maybe_pause(iteration, cb)
+            self._maybe_summarize(iteration)
             iteration_extra_kwargs = cb.fire_before_iteration(iteration, agent=self)
 
-            if max_exec_time and (time.monotonic() - start_time) > max_exec_time:
+            if max_exec_time and self._elapsed_excluding_pauses(start_time) > max_exec_time:
                 raise AgentTimeoutError(max_exec_time)
 
             # Rebuilt every iteration -- see _run_loop's identical comment.
@@ -1615,8 +2076,9 @@ class AgentLoopMixin:
             # with "not found" the moment it tried to call it.
             tool_map: Dict[str, Any] = {_tool_name(t): t for t in getattr(self, "tools", [])}
 
-            messages = self._trim_native_messages(messages)
-            call_messages = self._native_system_messages(memory_context) + messages
+            system_messages = self._native_system_messages(memory_context)
+            messages = self._trim_native_messages(messages, system_messages=system_messages)
+            call_messages = system_messages + messages
 
             call_kwargs = self._inject_agent_deadline(
                 {**extra_kwargs, **iteration_extra_kwargs}, start_time, max_exec_time
@@ -1640,6 +2102,7 @@ class AgentLoopMixin:
                 raw=response.raw,
                 **self._extract_llm_metadata(response.raw),
             )
+            self._history.record_thought(response.text if response.is_final_answer else None)
 
             if response.is_final_answer:
                 final_answer = response.text
@@ -1647,6 +2110,7 @@ class AgentLoopMixin:
                 if memory:
                     _record_agent_message(memory, final_answer)
                 cb.fire_agent_end(final_answer, agent=self)
+                self._history.finish(final_answer)
                 if logger:
                     logger.final_answer(final_answer)
                 return final_answer
@@ -1668,22 +2132,16 @@ class AgentLoopMixin:
             self._check_deadline(start_time, max_exec_time)
 
             if approved:
-                max_workers = min(len(approved), getattr(self, "MAX_TOOL_WORKERS", 8))
-                # Not a `with` block -- see the identical note in _run_loop:
-                # shutdown(wait=True) on __exit__ would block on a thread
-                # _collect_future_result already gave up on via tool_timeout.
-                pool = ThreadPoolExecutor(max_workers=max_workers)
-                try:
-                    futures = [(tc, pool.submit(self._execute_tool, tool_map, tc.name, tc.arguments)) for tc in approved]
-                    for tc, future in futures:
-                        result = self._collect_future_result(tc.name, future, tool_timeout)
-                        self._check_deadline(start_time, max_exec_time)
-                        cb.fire_tool_end(tc.name, result, agent=self)
-                        if logger:
-                            logger.tool_result(tc.name, result, iteration)
-                        calls_and_results.append((tc, result))
-                finally:
-                    pool.shutdown(wait=False)
+                # Reuses the run's one pool -- see _run_loop's identical note.
+                futures = [(tc, pool.submit(self._execute_tool, tool_map, tc.name, tc.arguments)) for tc in approved]
+                for tc, future in futures:
+                    result = self._collect_future_result(tc.name, future, tool_timeout)
+                    self._check_deadline(start_time, max_exec_time)
+                    cb.fire_tool_end(tc.name, result, agent=self)
+                    self._history.record_tool_result(tc.name, result)
+                    if logger:
+                        logger.tool_result(tc.name, result, iteration)
+                    calls_and_results.append((tc, result))
 
             results_by_call_id = {tc.call_id: result for tc, result in calls_and_results}
             for tc in response.tool_calls:
@@ -1691,7 +2149,9 @@ class AgentLoopMixin:
 
             self._record_native_step(iteration, calls_and_results)
 
-        raise AgentMaxIterationsError(max_iterations)
+          raise AgentMaxIterationsError(max_iterations)
+        finally:
+            pool.shutdown(wait=False)
 
     async def _arun_loop_native(
         self,
@@ -1710,21 +2170,32 @@ class AgentLoopMixin:
         tool_timeout: Optional[float] = getattr(self, "tool_timeout", None)
         logger = getattr(self, "logger", None)
         cb: CallbackManager = getattr(self, "callback_manager", CallbackManager())
-        memory_context = _get_memory_context(getattr(self, "memory", None), query)
+        memory_context = self._trim_memory_context(_get_memory_context(getattr(self, "memory", None), query))
         messages = self._build_native_messages(query)
 
-        for iteration in range(1, max_iterations + 1):
+        # See _arun_loop's identical comment.
+        tool_semaphore = asyncio.Semaphore(max(1, getattr(self, "MAX_TOOL_WORKERS", 8)))
+
+        # See _arun_loop's identical comment: bounded executor sync tool
+        # funcs are dispatched to instead of running inline on the loop.
+        tool_pool = ThreadPoolExecutor(max_workers=max(1, getattr(self, "MAX_TOOL_WORKERS", 8)))
+        try:
+          for iteration in range(1, max_iterations + 1):
             await cb.afire_iteration_start(iteration, agent=self)
+            self._history.begin_iteration(iteration)
+            await self._amaybe_pause(iteration, cb)
+            await self._amaybe_summarize(iteration)
             iteration_extra_kwargs = await cb.afire_before_iteration(iteration, agent=self)
 
-            if max_exec_time and (time.monotonic() - start_time) > max_exec_time:
+            if max_exec_time and self._elapsed_excluding_pauses(start_time) > max_exec_time:
                 raise AgentTimeoutError(max_exec_time)
 
             # Rebuilt every iteration -- see _run_loop_native's identical comment.
             tool_map: Dict[str, Any] = {_tool_name(t): t for t in getattr(self, "tools", [])}
 
-            messages = self._trim_native_messages(messages)
-            call_messages = self._native_system_messages(memory_context) + messages
+            system_messages = self._native_system_messages(memory_context)
+            messages = self._trim_native_messages(messages, system_messages=system_messages)
+            call_messages = system_messages + messages
 
             call_kwargs = self._inject_agent_deadline(
                 {**extra_kwargs, **iteration_extra_kwargs}, start_time, max_exec_time
@@ -1734,7 +2205,7 @@ class AgentLoopMixin:
                     lambda: self.llm.ainvoke_with_tools(call_messages, self.tools, **call_kwargs)  # type: ignore[attr-defined]
                 )
                 if max_exec_time:
-                    remaining = max_exec_time - (time.monotonic() - start_time)
+                    remaining = max_exec_time - self._elapsed_excluding_pauses(start_time)
                     if remaining <= 0:
                         raise AgentTimeoutError(max_exec_time)
                     response = await asyncio.wait_for(acall, timeout=remaining)
@@ -1759,6 +2230,7 @@ class AgentLoopMixin:
                 raw=response.raw,
                 **self._extract_llm_metadata(response.raw),
             )
+            self._history.record_thought(response.text if response.is_final_answer else None)
 
             if response.is_final_answer:
                 final_answer = response.text
@@ -1766,6 +2238,7 @@ class AgentLoopMixin:
                 if memory:
                     _record_agent_message(memory, final_answer)
                 await cb.afire_agent_end(final_answer, agent=self)
+                self._history.finish(final_answer)
                 if logger:
                     logger.final_answer(final_answer)
                 return final_answer
@@ -1787,13 +2260,17 @@ class AgentLoopMixin:
             self._check_deadline(start_time, max_exec_time)
 
             if approved:
-                results = await asyncio.gather(*[
-                    self._execute_tool_async_with_timeout(tool_map, tc.name, tc.arguments, tool_timeout)
-                    for tc in approved
-                ])
+                async def _run_bounded(tc: Any) -> str:
+                    async with tool_semaphore:
+                        return await self._execute_tool_async_with_timeout(
+                            tool_map, tc.name, tc.arguments, tool_timeout, pool=tool_pool
+                        )
+
+                results = await asyncio.gather(*[_run_bounded(tc) for tc in approved])
                 self._check_deadline(start_time, max_exec_time)
                 for tc, result in zip(approved, results):
                     await cb.afire_tool_end(tc.name, result, agent=self)
+                    self._history.record_tool_result(tc.name, result)
                     if logger:
                         logger.tool_result(tc.name, result, iteration)
                     calls_and_results.append((tc, result))
@@ -1804,7 +2281,9 @@ class AgentLoopMixin:
 
             self._record_native_step(iteration, calls_and_results)
 
-        raise AgentMaxIterationsError(max_iterations)
+          raise AgentMaxIterationsError(max_iterations)
+        finally:
+            tool_pool.shutdown(wait=False)
 
 
 # ── BaseAgent ──────────────────────────────────────────────────────────────────
@@ -1842,6 +2321,55 @@ class BaseAgent(ABC):
         # to the agent) can read them mid-run.
         self.scratchpad: str = ""
         self.current_query: str = ""
+
+        # Guards against two concurrent invoke()/ainvoke() calls on the same
+        # instance stomping on the shared mid-run state above. A plain Lock
+        # is safe from both the sync and async entry points: the critical
+        # section is just a flag check-and-set, never held across an await.
+        self._run_active: bool = False
+        self._run_lock = threading.Lock()
+
+        # Pause/resume support (in-process blocking) -- see README's "Pause
+        # & Resume" section. A plain threading.Event (not asyncio.Event):
+        # pause()/resume() must be safely callable from ANY thread, not
+        # necessarily the one running invoke()/ainvoke(), and Event's
+        # set()/clear()/wait() are thread-safe by construction -- the async
+        # loop offloads .wait() to a worker thread (AgentLoopMixin.
+        # _amaybe_pause) instead of blocking the event loop, so this one
+        # Event serves both loop flavors. Starts "set" (not paused).
+        self._resume_event: threading.Event = threading.Event()
+        self._resume_event.set()
+        self._paused_duration: float = 0.0
+        self._pause_reason: Optional[str] = None
+
+    def pause(self, reason: Optional[str] = None) -> "BaseAgent":
+        """Request a pause: the running loop (if any) blocks at its next
+        iteration boundary -- before the next LLM call, never mid-tool-call
+        or mid-LLM-call -- until resume() is called. Thread-safe: call it
+        from any thread, including one other than the thread invoke()/
+        ainvoke() is running on. Calling pause() before invoke()/ainvoke()
+        starts means that run begins already paused (blocks before its
+        first iteration) -- not a bug, a valid way to start an agent
+        pre-paused. Time spent paused does not count against
+        max_execution_time. See README's "Pause & Resume" section.
+        """
+        self._pause_reason = reason
+        self._resume_event.clear()
+        return self
+
+    def resume(self) -> "BaseAgent":
+        """Release a pending/active pause. No-op if not currently paused."""
+        self._pause_reason = None
+        self._resume_event.set()
+        return self
+
+    @property
+    def is_paused(self) -> bool:
+        """True from the moment pause() is called until resume() is called
+        -- regardless of whether the loop has actually reached a blocking
+        point yet (it may still be mid-LLM-call, which pause() never
+        interrupts)."""
+        return not self._resume_event.is_set()
 
     def add_tools(self, *tools: Any) -> "BaseAgent":
         """

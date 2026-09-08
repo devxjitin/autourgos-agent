@@ -24,12 +24,69 @@ Works with ANY OpenAI-compatible LLM
 
 from __future__ import annotations
 
+import inspect
+import threading
 from typing import Any, Callable, Dict, List, Optional
 
-from .base import AgentLoopMixin, BaseAgent, CallbackHandler, MemoryProtocol
+from .base import AgentAlreadyRunningError, AgentLoopMixin, BaseAgent, CallbackHandler, MemoryProtocol
+from .history import _NULL_HISTORY, _HistoryRecorder
 from .logging import AgentLogger
 from .prompt import LOGIC_PROMPT, PREFIX_PROMPT, SUFFIX_PROMPT
 from .runtime import parse_json_object
+
+
+class _FunctionStartHandler(CallbackHandler):
+    """Wraps a plain function passed as `Agent(on_agent_start=...)` into a
+    CallbackHandler, so it goes through the same CallbackManager machinery
+    (sync/async bridging, agent-kwarg detection) as any other middleware.
+
+    CallbackManager decides sync-vs-async dispatch by checking
+    inspect.iscoroutinefunction() on the *handler method itself*
+    (base.py's _fire/_afire: `getattr(h, method)` then that check) -- it
+    never awaits a coroutine returned from an ordinary ``def``. So if `fn`
+    is an `async def`, on_agent_start must ALSO be declared `async def`
+    (not just call an async fn from a sync one), or the coroutine `fn(...)`
+    returns would silently never run -- the same footgun the module
+    docstring for _call_sync_approval warns about for approval_callback.
+    Building the method per-instance (rather than one fixed method that
+    awaits conditionally) is what lets iscoroutinefunction see the right
+    answer for whichever kind of `fn` was passed.
+    """
+
+    def __init__(self, fn: Callable[..., Any]) -> None:
+        self._fn = fn
+        wants_agent = _accepts_agent_kwarg(fn)
+
+        if inspect.iscoroutinefunction(fn):
+            async def on_agent_start(query: str, agent: Any = None, **kwargs: Any) -> None:
+                if wants_agent:
+                    await fn(query, agent=agent)
+                else:
+                    await fn(query)
+        else:
+            def on_agent_start(query: str, agent: Any = None, **kwargs: Any) -> None:
+                if wants_agent:
+                    fn(query, agent=agent)
+                else:
+                    fn(query)
+
+        # Instance attribute (not a class method) so getattr(handler, "on_agent_start")
+        # returns exactly this function -- with the right iscoroutinefunction() answer
+        # for THIS fn -- instead of always resolving to one fixed class-level method.
+        self.on_agent_start = on_agent_start
+
+
+def _accepts_agent_kwarg(fn: Callable[..., Any]) -> bool:
+    """Whether `fn` can take an `agent=` keyword -- mirrors
+    CallbackManager._accepts_agent_kwarg (kept private there)."""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD or param.name == "agent":
+            return True
+    return False
 
 
 class Agent(AgentLoopMixin, BaseAgent):
@@ -116,10 +173,48 @@ class Agent(AgentLoopMixin, BaseAgent):
         Thought callbacks/logging are only fired on the final answer.
     max_scratchpad_chars : int, optional
         Per-instance override of MAX_SCRATCHPAD_CHARS (class default 15,000).
+        Also used as the built-in summarizer's char-threshold trigger when
+        ``summarize_every`` is set (see below) -- both share this one value.
+    summarize_every : int, optional
+        Enables built-in scratchpad summarization -- summarize every N
+        iterations (and/or once the scratchpad exceeds
+        ``max_scratchpad_chars``), using ``summarizer_llm`` if given, else
+        this agent's own ``llm``. None (default) leaves summarization
+        disabled -- the plain char-trim (``max_scratchpad_chars``) is all
+        that applies, matching prior behavior. See README's
+        "Auto-Summarizing Scratchpad" section.
+    summarizer_llm : any with .invoke(), optional
+        Dedicated LLM the built-in summarizer uses instead of this agent's
+        own ``llm`` -- e.g. a cheaper/faster model just for compression.
+        Only takes effect when ``summarize_every`` is also set; ignored
+        otherwise.
     max_tool_output_chars : int, optional
         Per-instance override of MAX_TOOL_OUTPUT_CHARS (class default 5,000).
     max_tool_workers : int, optional
         Per-instance override of MAX_TOOL_WORKERS (class default 8).
+    history : str, optional
+        Folder path. When set, every run is recorded to a Markdown + JSON
+        file pair under this folder (``Task_<timestamp>_<uid>.md``/``.json``)
+        -- thoughts, tool calls, observations, and the final answer, with
+        secret-shaped values (API keys, bearer tokens, JWTs, ...) redacted
+        before writing. Written directly from the agent loop, not via
+        `middleware=`. None (default) disables history recording entirely.
+    on_agent_start : callable, optional
+        Shortcut for the common case of wanting one function to run every
+        time this agent starts (invoke()/ainvoke()), without writing a full
+        CallbackHandler subclass. Called as fn(query) or, if it accepts it,
+        fn(query, agent=self) -- same signature convention as
+        CallbackHandler.on_agent_start. May be a plain function or an
+        `async def`; both work from invoke() and ainvoke() (see
+        CallbackManager's class docstring for how sync/async hooks are
+        bridged). Internally just registers a CallbackHandler wrapping this
+        function via add_middleware(), so it fires alongside (in the order
+        added, after) any handlers passed via `middleware=`. Equivalent to:
+
+            class _Start(CallbackHandler):
+                def on_agent_start(self, query, agent=None, **kw):
+                    fn(query)
+            agent.add_middleware(_Start())
     """
 
     MAX_CONSECUTIVE_PARSE_ERRORS: int = 3
@@ -149,8 +244,12 @@ class Agent(AgentLoopMixin, BaseAgent):
         system_prompt: str = "",
         tool_calling_mode: str = "prompt",
         max_scratchpad_chars: Optional[int] = None,
+        summarize_every: Optional[int] = None,
+        summarizer_llm: Optional[Any] = None,
         max_tool_output_chars: Optional[int] = None,
         max_tool_workers: Optional[int] = None,
+        on_agent_start: Optional[Callable[..., Any]] = None,
+        history: Optional[str] = None,
     ) -> None:
         if tool_calling_mode not in ("prompt", "native"):
             raise ValueError(
@@ -180,6 +279,17 @@ class Agent(AgentLoopMixin, BaseAgent):
         self.prompt_template = PREFIX_PROMPT + LOGIC_PROMPT + SUFFIX_PROMPT
         if max_scratchpad_chars is not None:
             self.MAX_SCRATCHPAD_CHARS = max_scratchpad_chars
+        # Built-in scratchpad summarization -- inline in the loop (see
+        # AgentLoopMixin._maybe_summarize/_amaybe_summarize in base.py),
+        # NOT implemented via the CallbackHandler/middleware mechanism:
+        # this only ever applies to the one Agent instance it's configured
+        # on, so it needs none of a middleware's cross-instance-sharing
+        # machinery (per-agent locks/registries).
+        self.summarize_every = summarize_every
+        self.summarizer_llm = summarizer_llm
+        self._summarizer_lock = threading.Lock()
+        self._last_summarized_length: Optional[int] = None
+        self._warned_native_summarize = False
         if max_tool_output_chars is not None:
             self.MAX_TOOL_OUTPUT_CHARS = max_tool_output_chars
         if max_tool_workers is not None:
@@ -189,6 +299,9 @@ class Agent(AgentLoopMixin, BaseAgent):
             agent_name="Agent",
             full_output=full_output,
         )
+        if on_agent_start is not None:
+            self.add_middleware(_FunctionStartHandler(on_agent_start))
+        self._history = _HistoryRecorder(folder=history) if history else _NULL_HISTORY
 
     # ── response parser ────────────────────────────────────────────────────────
 
@@ -247,6 +360,11 @@ class Agent(AgentLoopMixin, BaseAgent):
         if not self.llm:
             raise ValueError("No LLM provided. Pass llm= to Agent().")
 
+        with self._run_lock:
+            if self._run_active:
+                raise AgentAlreadyRunningError()
+            self._run_active = True
+
         self.current_query = query
         resolved_max_iterations = (
             self.max_iterations if max_iterations is None else max_iterations
@@ -258,6 +376,7 @@ class Agent(AgentLoopMixin, BaseAgent):
                 self.logger.memory_action("Added user message to memory.")
 
             self.callback_manager.fire_agent_start(query, agent=self)
+            self._history.start(query, agent_name=self.__class__.__name__)
             self.logger.run_start(query)
 
             if self.tool_calling_mode == "native":
@@ -281,8 +400,11 @@ class Agent(AgentLoopMixin, BaseAgent):
             # flushing logs, deleting temp files) exclusively there. Bare
             # `raise` re-propagates it completely unchanged.
             self.callback_manager.fire_agent_error(exc, agent=self)
+            self._history.fail(exc)
             raise
         finally:
+            with self._run_lock:
+                self._run_active = False
             self.logger.run_end()
 
     async def ainvoke(self, query: str, max_iterations: Optional[int] = None, **kwargs: Any) -> str:
@@ -298,6 +420,11 @@ class Agent(AgentLoopMixin, BaseAgent):
         """
         if not self.llm:
             raise ValueError("No LLM provided. Pass llm= to Agent().")
+
+        with self._run_lock:
+            if self._run_active:
+                raise AgentAlreadyRunningError()
+            self._run_active = True
 
         self.current_query = query
         resolved_max_iterations = (
@@ -320,6 +447,7 @@ class Agent(AgentLoopMixin, BaseAgent):
             self.callback_manager.capture_run_context()
 
             await self.callback_manager.afire_agent_start(query, agent=self)
+            self._history.start(query, agent_name=self.__class__.__name__)
             self.logger.run_start(query)
 
             if self.tool_calling_mode == "native":
@@ -341,6 +469,9 @@ class Agent(AgentLoopMixin, BaseAgent):
             # still fires on_agent_error -- see invoke()'s identical comment.
             # Bare `raise` re-propagates cancellation completely unchanged.
             await self.callback_manager.afire_agent_error(exc, agent=self)
+            self._history.fail(exc)
             raise
         finally:
+            with self._run_lock:
+                self._run_active = False
             self.logger.run_end()

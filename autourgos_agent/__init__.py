@@ -34,6 +34,7 @@ from .base    import (
     AgentParseError,
     AgentLLMError,
     AgentEmptyResponseError,
+    AgentAlreadyRunningError,
 )
 from .logging import AgentLogger
 from .runtime import build_tool_list, parse_json_object, inject_prompt_block, remove_prompt_block
@@ -75,6 +76,7 @@ __all__ = [
     "AgentParseError",
     "AgentLLMError",
     "AgentEmptyResponseError",
+    "AgentAlreadyRunningError",
     # utilities
     "AgentLogger",
     "build_tool_list",

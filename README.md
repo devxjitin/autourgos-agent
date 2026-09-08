@@ -7,11 +7,49 @@
 [![Maintainer](https://img.shields.io/badge/Maintainer-Sonia-blueviolet.svg)](https://github.com/dahiyasonia)
 [![Maintainer](https://img.shields.io/badge/Maintainer-Vishwanil%20Suman-blueviolet.svg)]()
 
-A self-contained **general-purpose LLM agent** for the Autourgos framework.
+> A self-contained, **general-purpose LLM agent** for the Autourgos framework — reasoning and acting in one clean loop, with any OpenAI-compatible LLM you already have.
 
 The agent alternates between **Thought** (reasoning about what to do next) and **Action** (calling a tool), looping until it has enough information to give a **Final Answer**.
 
-Fully self-contained — no *third-party* dependencies beyond Python 3.10+ (only `autourgos-core`, itself a zero-dependency stdlib utility library shared across the framework). Plug in any LLM wrapper you already have.
+**Fully self-contained** — zero third-party runtime dependencies beyond Python 3.10+ (only `autourgos-core`, itself a zero-dependency stdlib utility library shared across the framework). No forced LLM SDK, no forced vector store, no hidden network calls at import time. Bring your own LLM wrapper.
+
+<table>
+<tr><td width="50%" valign="top">
+
+**🧠 Core loop**
+- Thought → Action → Observation, JSON-driven
+- Native structured tool-calling mode too
+- Parallel tool calls (thread pool / `asyncio.gather`)
+- Async everywhere — every method has an `a`-prefixed twin
+
+</td><td width="50%" valign="top">
+
+**🧩 Built in, zero extra install**
+- Lazy-loaded **toolboxes** for large tool catalogs
+- Per-iteration **file/callback injection** (screenshots, live data)
+- **Run history** to disk, secrets auto-redacted
+- **Pause / resume** an in-flight run from any thread
+- Auto-summarizing scratchpad, retry-with-backoff, timeouts
+
+</td></tr>
+<tr><td width="50%" valign="top">
+
+**🔌 Extensible**
+- `CallbackHandler` middleware — 11 lifecycle hooks
+- Sync or async hooks, mixed freely, from either loop
+- Approval callbacks for human-in-the-loop / safety gates
+- Works with `autourgos-hcix`, `autourgos-skills`, and any
+  hand-written middleware
+
+</td><td width="50%" valign="top">
+
+**🌐 Any LLM**
+- OpenAI, Groq, Together AI, Mistral, DeepSeek, Perplexity
+- Ollama / LM Studio / vLLM — fully local, no API key
+- Anything with `.invoke()` / `.ainvoke()` — no lock-in
+
+</td></tr>
+</table>
 
 ---
 
@@ -46,36 +84,45 @@ This continues until the agent has a final answer or hits the iteration/time lim
 
 ## Table of Contents
 
-- [Install](#install)
-- [Quick Start](#quick-start)
-- [How the agent Loop Works](#how-the-react-loop-works)
-- [Defining Tools](#defining-tools)
-- [Works With Any LLM](#works-with-any-llm)
-- [Async Agent](#async-agent)
-- [Parallel Tool Calls](#parallel-tool-calls)
-- [Native Tool Calling](#native-tool-calling)
-- [Verbose Mode](#verbose-mode)
-- [Memory](#memory)
-- [Approval Callback](#approval-callback)
-- [Middleware / Callbacks](#middleware--callbacks)
+**Getting started**
+- [📦 Install](#install)
+- [🚀 Quick Start](#quick-start)
+- [🧠 How the Agent Loop Works](#how-the-agent-loop-works)
+- [🔧 Defining Tools](#defining-tools)
+- [🌐 Works With Any LLM](#works-with-any-llm)
+
+**Running the agent**
+- [⚡ Async Agent](#async-agent)
+- [🧵 Parallel Tool Calls](#parallel-tool-calls)
+- [🎯 Native Tool Calling](#native-tool-calling)
+- [📢 Verbose Mode](#verbose-mode)
+- [💾 Memory](#memory)
+- [🔐 Approval Callback](#approval-callback)
+
+**Extending the agent**
+- [🧩 Middleware / Callbacks](#middleware--callbacks)
   - [Middleware Integration Contract](#middleware-integration-contract)
-- [`on_agent_start` Shortcut](#on_agent_start-shortcut)
-- [Toolboxes (Lazy-Loaded Tool Groups)](#toolboxes-lazy-loaded-tool-groups)
-- [Pre-Iteration Middleware](#pre-iteration-middleware)
-- [Run History](#run-history)
-- [Pause & Resume](#pause--resume)
-- [Testing](#testing)
-- [Context Manager](#context-manager)
-- [Time and Iteration Limits](#time-and-iteration-limits)
-- [Scratchpad Size Limits](#scratchpad-size-limits)
+- [▶️ `on_agent_start` Shortcut](#on_agent_start-shortcut)
+- [📚 Toolboxes (Lazy-Loaded Tool Groups)](#toolboxes-lazy-loaded-tool-groups)
+- [📸 Pre-Iteration Files & Callbacks](#pre-iteration-files--callbacks)
+- [📜 Run History](#run-history)
+- [⏸️ Pause & Resume](#pause--resume)
+
+**Operating it in production**
+- [🧪 Testing](#testing)
+- [🔒 Context Manager](#context-manager)
+- [⏱️ Time and Iteration Limits](#time-and-iteration-limits)
+- [✂️ Scratchpad Size Limits](#scratchpad-size-limits)
   - [Auto-Summarizing Scratchpad](#auto-summarizing-scratchpad)
-- [LLM Call Retries](#llm-call-retries)
-- [Custom System Prompt](#custom-system-prompt)
-- [Constructor Reference](#constructor-reference)
-- [Tool Dict Reference](#tool-dict-reference)
-- [What the Agent Returns](#what-the-agent-returns)
-- [Error Tags](#error-tags)
-- [v1 Backward Compatibility](#v1-backward-compatibility)
+- [🔁 LLM Call Retries](#llm-call-retries)
+- [📝 Custom System Prompt](#custom-system-prompt)
+
+**Reference**
+- [📋 Constructor Reference](#constructor-reference)
+- [📋 Tool Dict Reference](#tool-dict-reference)
+- [↩️ What the Agent Returns](#what-the-agent-returns)
+- [⚠️ Exceptions](#exceptions)
+- [🕰️ v1 Backward Compatibility](#v1-backward-compatibility)
 
 ---
 
@@ -145,7 +192,7 @@ and `Parse Error:` in red.)
 
 ---
 
-## How the agent Loop Works
+## How the Agent Loop Works
 
 Each iteration the agent produces a JSON object:
 
@@ -718,21 +765,20 @@ produced the line, e.g.:
 
 Use `getattr(agent, "logger", None)` (not a direct import of `AgentLogger`) so your
 middleware doesn't crash if it's ever attached to something other than a `Agent`,
-and does nothing when `verbose=False`. The built-in summarizer (see
-[Auto-Summarizing Scratchpad](#auto-summarizing-scratchpad) — implemented
-inline, not as middleware, but narrates the same way), the built-in
-`ToolboxMiddleware` and `PreIterationMiddleware` (both native to this
-package — see [Toolboxes](#toolboxes-lazy-loaded-tool-groups) and
-[Pre-Iteration Middleware](#pre-iteration-middleware)), and sibling
-middleware packages (e.g. autourgos-hcix) all use this same pattern to
-narrate their own actions.
+and does nothing when `verbose=False`. The built-in summarizer and pre-iteration
+runtime (see [Auto-Summarizing Scratchpad](#auto-summarizing-scratchpad) and
+[Pre-Iteration Files & Callbacks](#pre-iteration-files--callbacks) — both
+implemented inline, not as middleware, but narrate the same way), the built-in
+`ToolboxMiddleware` (see [Toolboxes](#toolboxes-lazy-loaded-tool-groups)), and
+sibling middleware packages (e.g. `autourgos-hcix`, `autourgos-skills`) all use
+this same pattern to narrate their own actions.
 
 ### Middleware Integration Contract
 
 These are the three pieces of surface area sibling middleware (the built-in
-`ToolboxMiddleware`/`PreIterationMiddleware`, autourgos-hcix, and anything
-else you write) can rely on. This is the official, stable contract — treat
-it as public API.
+`ToolboxMiddleware`, `PreIterationMiddleware`, `autourgos-hcix`,
+`autourgos-skills`, and anything else you write) can rely on. This is the
+official, stable contract — treat it as public API.
 
 **`agent.scratchpad` (str)**
 A real, live instance attribute, not just a local loop variable. It is
@@ -924,14 +970,24 @@ agent.add_middleware(mw)
 
 ---
 
-## Pre-Iteration Middleware
+## Pre-Iteration Files & Callbacks
 
-`PreIterationMiddleware` runs a callback and/or injects files (e.g. a fresh
-screenshot) before every agent iteration — useful for computer-use / vision
-agents, live data feeds, or anything that needs to refresh before each step.
+Run a callback and/or inject files (e.g. a fresh screenshot) before every
+agent iteration — useful for computer-use / vision agents, live data feeds,
+or anything that needs to refresh before each step.
+
+There are **two ways** to wire this up. Use `pre_iteration_callback=`/
+`pre_iteration_files=` on `Agent()` unless you specifically need one
+instance shared across multiple concurrent agents — see the comparison
+below.
+
+### Recommended: `Agent(pre_iteration_callback=..., pre_iteration_files=...)`
+
+Built directly into the agent loop (not middleware) — same pattern as
+`history=`/`summarize_every=`. Zero wiring, zero overhead when unset:
 
 ```python
-from autourgos_agent import Agent, PreIterationMiddleware
+from autourgos_agent import Agent
 from autourgos_openaichat import OpenAIChatModel
 
 SCREENSHOT = "/tmp/screen.png"
@@ -939,26 +995,23 @@ SCREENSHOT = "/tmp/screen.png"
 def capture(iteration: int) -> None:
     take_screenshot(SCREENSHOT)  # your own screenshot function
 
-middleware = PreIterationMiddleware(
-    callback=capture,
-    files=SCREENSHOT,
-    image_quality="low",   # downscale to <=512px, JPEG q60 -- ~85 tokens flat
-)
-
 agent = Agent(
     llm=OpenAIChatModel(model="gpt-4o"),
-    middleware=[middleware],
+    pre_iteration_callback=capture,
+    pre_iteration_files=SCREENSHOT,
+    image_quality="low",   # downscale to <=512px, JPEG q60 -- ~85 tokens flat
 )
 result = agent.invoke("Click the 'Submit' button on screen.")
 ```
 
-`files=` also accepts a callable that returns a path (or list of paths) for
-dynamic/per-iteration file names, and non-image files are passed through
-unmodified:
+`pre_iteration_files=` also accepts a callable that returns a path (or list
+of paths) for dynamic/per-iteration file names, and non-image files are
+passed through unmodified:
 
 ```python
-middleware = PreIterationMiddleware(
-    files=lambda iteration: f"/tmp/screen_{iteration}.png",
+agent = Agent(
+    llm=OpenAIChatModel(model="gpt-4o"),
+    pre_iteration_files=lambda iteration: f"/tmp/screen_{iteration}.png",
 )
 ```
 
@@ -969,12 +1022,39 @@ Pillow: `pip install 'autourgos-agent[images]'` — without it, only the
 `detail=` hint is applied (still saves tokens on the OpenAI side) and the
 original image is sent unresized.
 
-Run multiple callbacks with `SEQUENTIAL` (one after another) or `PARALLEL`
-(concurrently — sync callbacks in a thread pool, async ones as asyncio
-tasks):
+The callback can be sync or async, and runs safely from both `invoke()`
+(directly) and `ainvoke()` (offloaded to a worker thread so it never
+blocks the event loop). A callback that raises is logged (at `ERROR`) and
+does not stop the agent run.
+
+### Advanced: `PreIterationMiddleware` (shared across multiple agents)
+
+Same behavior, but as an explicit `CallbackHandler` you construct yourself
+and pass via `middleware=` — the right choice **only** when one instance
+genuinely needs to be shared across several concurrently-running agents
+(it tracks per-agent state internally so runs never clash):
 
 ```python
-from autourgos_agent import PreIterationMiddleware, SEQUENTIAL, PARALLEL
+from autourgos_agent import Agent, PreIterationMiddleware
+from autourgos_openaichat import OpenAIChatModel
+
+middleware = PreIterationMiddleware(
+    callback=capture,
+    files=SCREENSHOT,
+    image_quality="low",
+)
+
+agent_a = Agent(llm=OpenAIChatModel(model="gpt-4o"), middleware=[middleware])
+agent_b = Agent(llm=OpenAIChatModel(model="gpt-4o"), middleware=[middleware])
+# both agents safely share the same middleware instance and its temp-file cache
+```
+
+Run multiple callbacks with `SEQUENTIAL` (one after another) or `PARALLEL`
+(concurrently — sync callbacks in a thread pool, async ones as asyncio
+tasks) — works with either wiring style above:
+
+```python
+from autourgos_agent import SEQUENTIAL, PARALLEL
 
 def log_step(iteration: int) -> None:
     print(f"Iteration {iteration} starting")
@@ -982,16 +1062,13 @@ def log_step(iteration: int) -> None:
 async def refresh_cache(iteration: int) -> None:
     await cache.refresh()
 
-middleware = PreIterationMiddleware(
-    callback=SEQUENTIAL[capture, log_step],       # capture, then log, in order
-    # or: callback=PARALLEL[capture, refresh_cache],  # both at once
-    files=SCREENSHOT,
+agent = Agent(
+    llm=OpenAIChatModel(model="gpt-4o"),
+    pre_iteration_callback=SEQUENTIAL[capture, log_step],      # capture, then log, in order
+    # or: pre_iteration_callback=PARALLEL[capture, refresh_cache],  # both at once
+    pre_iteration_files=SCREENSHOT,
 )
 ```
-
-Callbacks can be sync or async and are run safely from both `invoke()` and
-`ainvoke()`. A callback that raises is logged (at `ERROR`) and does not
-stop the agent run.
 
 ---
 
@@ -1368,6 +1445,9 @@ result = agent.invoke("What is the P/E ratio of Apple?")
 | `max_tool_workers` | `int` | `None` (class default 8) | Per-instance override of the thread-pool size `invoke()` uses to run parallel tool calls. See [Parallel Tool Calls](#parallel-tool-calls) |
 | `on_agent_start` | `callable` | `None` | `fn(query)` (or `fn(query, agent=self)`) run every time this agent starts, without writing a full `CallbackHandler`. See [`on_agent_start` Shortcut](#on_agent_start-shortcut) |
 | `history` | `str` | `None` | Folder path — records every run to a Markdown + JSON file pair, with secrets redacted. See [Run History](#run-history) |
+| `pre_iteration_callback` | `callable` | `None` | Sync or async `fn(iteration)` run before every iteration. See [Pre-Iteration Files & Callbacks](#pre-iteration-files--callbacks) |
+| `pre_iteration_files` | `str \| list[str] \| callable` | `None` | File path(s) (or a callable returning them) injected into the LLM call at every iteration |
+| `image_quality` | `str \| int` | `"auto"` | Screenshot/image token-cost control for `pre_iteration_files`: `"auto"`, `"high"`, `"medium"`, `"low"`, or an `int` 1–100 JPEG quality. Ignored when `pre_iteration_files` isn't set |
 
 ---
 
